@@ -33,6 +33,18 @@ function isRestrictedUrl(url) {
 		url.startsWith('data:');
 }
 
+// Disable/enable the checkbox
+function setEnabledCheckboxAllowed(allowed, reasonText = '') {
+  enabled.disabled = !allowed;
+
+  // Grey out the whole row if your HTML has a wrapper; if not, this still works fine
+  if (!allowed) {
+    enabled.title = reasonText || 'Not allowed on this page';
+  } else {
+    enabled.title = '';
+  }
+}
+
 // Extract domain from URL
 function getDomainFromUrl(url) {
 	try {
@@ -207,7 +219,10 @@ async function eventHandler(e) {
 
 		// Check if this is a restricted URL
 		if (isRestrictedUrl(tab.url)) {
+			enabled.checked = false; // revert UI
+			await chrome.storage.local.set({ enabled: false }); // keep storage consistent
 			showRestrictedPageError();
+			setEnabledCheckboxAllowed(false, 'This extension cannot run on this type of page (Chrome restricted URL).');
 			return;
 		}
 
@@ -228,7 +243,11 @@ async function eventHandler(e) {
 			});
 		} catch (error) {
 			console.error('Error applying gradient:', error);
+			enabled.checked = false;
+			await chrome.storage.local.set({ enabled: false });
 			showRestrictedPageError();
+			// Don’t permanently disable it here because errors can be transient,
+			// but at least make the UI honest for this moment.
 		}
 	}
 
@@ -289,16 +308,26 @@ async function checkCurrentPage() {
 			const tab = tabs[0];
 
 			if (isRestrictedUrl(tab.url)) {
+				// Show restricted message and disable controls
 				showRestrictedPageError();
+				setEnabledCheckboxAllowed(false, 'This extension cannot run on this type of page (Chrome restricted URL).');
 				return;
 			}
 
+			// Normal page
 			showNormalContent();
+			setEnabledCheckboxAllowed(true);
 
 			// Get current domain
 			currentDomain = getDomainFromUrl(tab.url);
 			await updateCurrentDomainUI();
 			await updateBlacklistUI();
+
+			if (currentDomain && await isDomainBlacklisted(currentDomain)) {
+				setEnabledCheckboxAllowed(false, 'Disabled on this site (blacklist). Use “Enable here” to allow it.');
+			} else {
+				setEnabledCheckboxAllowed(true);
+			}
 		}
 	} catch (error) {
 		console.error('Error checking current page:', error);
