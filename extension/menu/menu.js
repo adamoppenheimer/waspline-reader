@@ -7,6 +7,10 @@ const color_text = document.getElementById('color_text');
 const gradient_size = document.getElementById('gradient_size');
 const enabled = document.getElementById('enabled');
 
+const btnSaveMyDefault = document.getElementById('save-my-default');
+const btnResetMyDefault = document.getElementById('reset-my-default');
+const btnResetExtDefault = document.getElementById('reset-ext-default');
+
 // ----- helpers -----
 function isRestrictedUrl(url) {
   if (!url) return true;
@@ -41,34 +45,32 @@ async function getActiveTab() {
   return tabs && tabs[0] ? tabs[0] : null;
 }
 
-async function loadGlobalSettingsIntoUI() {
-  const result = await chrome.storage.local.get({
-    color1: "#0000FF",
-    color2: "#FF0000",
-    color_text: "#000000",
-    gradient_size: 50
-  });
-
-  color1.value = result.color1;
-  color2.value = result.color2;
-  color_text.value = result.color_text;
-  gradient_size.value = result.gradient_size;
-}
-
-async function saveGlobalSettingsFromUI() {
-  await chrome.storage.local.set({
+function readSettingsFromUI() {
+  return {
     color1: color1.value,
     color2: color2.value,
     color_text: color_text.value,
-    gradient_size: gradient_size.value
-  });
+    gradient_size: Number(gradient_size.value)
+  };
 }
 
-// Sync checkbox state + disabled state for the current tab
+function writeSettingsToUI(settings) {
+  color1.value = settings.color1;
+  color2.value = settings.color2;
+  color_text.value = settings.color_text;
+  gradient_size.value = settings.gradient_size;
+}
+
+// Pull current tab info from background
+async function getTabInfo(tabId) {
+  return await chrome.runtime.sendMessage({ type: "GET_TAB_INFO", tabId });
+}
+
 async function syncUIToCurrentTab() {
   const tab = await getActiveTab();
   if (!tab) return;
 
+  // Restriction checks
   if (isRestrictedUrl(tab.url)) {
     enabled.checked = false;
     setEnabledAllowed(false, "Not allowed on this type of page.");
@@ -84,81 +86,129 @@ async function syncUIToCurrentTab() {
 
   setEnabledAllowed(true);
 
-  const res = await chrome.runtime.sendMessage({
-    type: "GET_TAB_ENABLED",
-    tabId: tab.id
-  });
+  const info = await getTabInfo(tab.id);
+  if (!info?.ok) return;
 
-  enabled.checked = !!(res && res.enabled);
+  enabled.checked = !!info.enabled;
+  writeSettingsToUI(info.settings);
 }
 
-// ----- main event handler -----
-async function eventHandler(e) {
+// ----- behavior: any setting change updates this tab immediately (if enabled) -----
+async function onSettingChanged(e) {
   const tab = await getActiveTab();
   if (!tab) return;
 
-  // Always save global settings (colors/size) when user changes any control
-  await saveGlobalSettingsFromUI();
-
-  // If current page can't run scripts, force UI off for this tab
   if (isRestrictedUrl(tab.url) || !(await canInjectIntoTab(tab.id))) {
     enabled.checked = false;
     setEnabledAllowed(false, "This extension can't run on this page.");
     return;
   }
-
   setEnabledAllowed(true);
 
-  // If Enabled checkbox toggled: set per-tab enabled state via background
-  if (e && e.target === enabled) {
-    const desired = enabled.checked;
+  const settings = readSettingsFromUI();
 
-    const res = await chrome.runtime.sendMessage({
-      type: "SET_TAB_ENABLED",
-      tabId: tab.id,
-      enabled: desired
-    });
-
-    if (desired && (!res || !res.ok)) {
-      enabled.checked = false;
-
-      const reason =
-        res && res.reason === "restricted" ? "Not allowed on this type of page." :
-        res && res.reason === "inject_failed" ? "Chrome blocked script injection on this site." :
-        "Could not enable on this page.";
-
-      setEnabledAllowed(false, reason);
-      return;
-    }
-
-    setEnabledAllowed(true);
-    return;
-  }
-
-  // If user changed colors/size and this tab is enabled, re-apply by “setting enabled true” again
-  const resEnabled = await chrome.runtime.sendMessage({
-    type: "GET_TAB_ENABLED",
-    tabId: tab.id
+  // Save settings to this tab (does not affect other tabs)
+  await chrome.runtime.sendMessage({
+    type: "SET_TAB_SETTINGS",
+    tabId: tab.id,
+    settings
   });
 
-  if (resEnabled && resEnabled.enabled) {
-    await chrome.runtime.sendMessage({
-      type: "SET_TAB_ENABLED",
-      tabId: tab.id,
-      enabled: true
-    });
+  // If enabled checkbox is ON, bg.js will apply immediately after SET_TAB_SETTINGS.
+  // If OFF, it just stores the per-tab settings for next time you enable.
+}
+
+// ----- behavior: toggle enabled for this tab -----
+async function onEnabledToggled(e) {
+  const tab = await getActiveTab();
+  if (!tab) return;
+
+  if (isRestrictedUrl(tab.url) || !(await canInjectIntoTab(tab.id))) {
+    enabled.checked = false;
+    setEnabledAllowed(false, "This extension can't run on this page.");
+    return;
+  }
+  setEnabledAllowed(true);
+
+  // Ensure bg has latest settings for this tab before enabling
+  const settings = readSettingsFromUI();
+  await chrome.runtime.sendMessage({
+    type: "SET_TAB_SETTINGS",
+    tabId: tab.id,
+    settings
+  });
+
+  const res = await chrome.runtime.sendMessage({
+    type: "SET_TAB_ENABLED",
+    tabId: tab.id,
+    enabled: enabled.checked
+  });
+
+  if (enabled.checked && (!res || !res.ok)) {
+    enabled.checked = false;
+    const reason =
+      res && res.reason === "restricted" ? "Not allowed on this type of page." :
+      res && res.reason === "inject_failed" ? "Chrome blocked script injection on this site." :
+      "Could not enable on this page.";
+    setEnabledAllowed(false, reason);
+  }
+}
+
+// ----- buttons -----
+async function onSaveMyDefault() {
+  const settings = readSettingsFromUI();
+
+  // Save global user default (does not affect other tabs)
+  await chrome.runtime.sendMessage({
+    type: "SET_USER_DEFAULTS",
+    userDefaults: settings
+  });
+}
+
+async function onResetMyDefault() {
+  const tab = await getActiveTab();
+  if (!tab) return;
+
+  const res = await chrome.runtime.sendMessage({
+    type: "RESET_TAB_TO_DEFAULTS",
+    tabId: tab.id,
+    which: "user"
+  });
+
+  if (res?.ok && res.settings) {
+    writeSettingsToUI(res.settings);
+  }
+}
+
+async function onResetExtDefault() {
+  const tab = await getActiveTab();
+  if (!tab) return;
+
+  const res = await chrome.runtime.sendMessage({
+    type: "RESET_TAB_TO_DEFAULTS",
+    tabId: tab.id,
+    which: "ext"
+  });
+
+  if (res?.ok && res.settings) {
+    writeSettingsToUI(res.settings);
   }
 }
 
 // ----- init -----
 (async function init() {
-  await loadGlobalSettingsIntoUI();
   await syncUIToCurrentTab();
 })();
 
 // ----- listeners -----
-document.getElementById("enabled").addEventListener("change", eventHandler);
-document.getElementById("gradient_size").addEventListener("change", eventHandler);
-document.getElementById("color1").addEventListener("change", eventHandler);
-document.getElementById("color2").addEventListener("change", eventHandler);
-document.getElementById("color_text").addEventListener("change", eventHandler);
+enabled.addEventListener("change", onEnabledToggled);
+
+gradient_size.addEventListener("change", onSettingChanged);
+color1.addEventListener("change", onSettingChanged);
+color2.addEventListener("change", onSettingChanged);
+color_text.addEventListener("change", onSettingChanged);
+
+// Buttons
+btnSaveMyDefault.addEventListener("click", onSaveMyDefault);
+btnResetMyDefault.addEventListener("click", onResetMyDefault);
+btnResetExtDefault.addEventListener("click", onResetExtDefault);
