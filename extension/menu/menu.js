@@ -51,6 +51,21 @@ function checkInjectable(tabId) {
   });
 }
 
+function ensureContentScriptInjected(tabId) {
+  return new Promise((resolve, reject) => {
+    chrome.scripting.executeScript(
+      {
+        target: { tabId: tabId },
+        files: ["contentScript.js"] // NOTE: no leading slash
+      },
+      () => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve();
+      }
+    );
+  });
+}
+
 // Listen for clicks on the input elements, and send the appropriate message
 // to the content script in the page.
 function eventHandler(e) {
@@ -85,20 +100,22 @@ function eventHandler(e) {
 
       // Helper: send apply message
       async function applyGradientToTab() {
-        await chrome.tabs.sendMessage(tab.id, {
-          command: "apply_gradient",
-          colors: [color1.value, color2.value],
-          color_text: color_text.value,
-          gradient_size: gradient_size.value
-        });
+         await ensureContentScriptInjected(tab.id);
+         await chrome.tabs.sendMessage(tab.id, {
+            command: "apply_gradient",
+            colors: [color1.value, color2.value],
+            color_text: color_text.value,
+            gradient_size: gradient_size.value
+         });
       }
 
       // Helper: send reset message
       async function resetTab() {
-        await chrome.tabs.sendMessage(tab.id, {
-          command: "reset",
-          color_text: color_text.value
-        });
+         await ensureContentScriptInjected(tab.id);
+         await chrome.tabs.sendMessage(tab.id, {
+            command: "reset",
+            color_text: color_text.value
+         });
       }
 
       // Apply or reset based on enabled state
@@ -110,8 +127,9 @@ function eventHandler(e) {
     } catch (error) {
       // If something went wrong (e.g., message fails), revert UI for this page only
       console.error(error);
+      // If injection is blocked, disable; otherwise just revert the checkmark
       enabled.checked = false;
-      setEnabledAllowed(false, "Could not apply on this page.");
+      setEnabledAllowed(true);
     }
   });
 }
