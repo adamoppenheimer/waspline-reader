@@ -25,7 +25,7 @@ function hex_to_rgb(hex) {
 function computeGradientColors(baseColor, activeColor, steps, gradientSize) {
 	const colors = new Array(steps);
 	const factor = gradientSize / 50;
-	
+
 	for (let i = 0; i < steps; i++) {
 		const t = 1 - (i / ((steps - 1) * factor || 1));
 		const r = (baseColor[0] * (1 - t) + activeColor[0] * t) | 0;
@@ -40,7 +40,7 @@ function computeGradientColors(baseColor, activeColor, steps, gradientSize) {
 function colorLine(spans, gradientColors, reverse) {
 	const len = spans.length;
 	const colorLen = gradientColors.length;
-	
+
 	for (let i = 0; i < len; i++) {
 		const idx = reverse ? len - 1 - i : i;
 		const colorIdx = Math.min(Math.floor(i * colorLen / len), colorLen - 1);
@@ -49,29 +49,43 @@ function colorLine(spans, gradientColors, reverse) {
 }
 
 // Process paragraphs in batches using requestAnimationFrame
-function processBatch(paragraphs, startIdx, colors, baseColor, gradientSize, lineno, resolve) {
+function processBatch(paragraphs, startIdx, colors, baseColor, gradientSize, lineno, resolve, mode) {
 	const endIdx = Math.min(startIdx + BATCH_SIZE, paragraphs.length);
 	const activeColors = colors.map(c => hex_to_rgb(c));
-	
+
 	for (let i = startIdx; i < endIdx; i++) {
 		const paragraph = paragraphs[i];
+		// Skip code blocks / preformatted text
+		if (paragraph.closest('pre, code')) continue;
+
+		// When applying, avoid reprocessing the same elements
+		if (mode === "apply") {
+			if (paragraph.dataset.wasplineProcessed === '1') continue;
+			paragraph.dataset.wasplineProcessed = '1';
+		}
+
+		// When resetting, allow everything and clear marker
+		if (mode === "reset") {
+			delete paragraph.dataset.wasplineProcessed;
+		}
+
 		if (!paragraph.textContent || paragraph.textContent.trim().length < 2) continue;
-		
+
 		try {
 			const lines = lineWrapDetector.getLines(paragraph);
-			
+
 			for (const line of lines) {
 				if (!line || line.length === 0) continue;
-				
+
 				const colorIdx = Math.floor(lineno / 2) % activeColors.length;
 				const isLeft = (lineno % 2 === 0);
 				const gradientColors = computeGradientColors(
-					baseColor, 
-					activeColors[colorIdx], 
+					baseColor,
+					activeColors[colorIdx],
 					Math.min(line.length, GRADIENT_STEPS),
 					gradientSize
 				);
-				
+
 				colorLine(line, gradientColors, isLeft);
 				lineno++;
 			}
@@ -79,7 +93,7 @@ function processBatch(paragraphs, startIdx, colors, baseColor, gradientSize, lin
 			// Skip failed paragraphs
 		}
 	}
-	
+
 	if (endIdx < paragraphs.length) {
 		// Continue with next batch on next frame
 		requestAnimationFrame(() => {
@@ -91,21 +105,30 @@ function processBatch(paragraphs, startIdx, colors, baseColor, gradientSize, lin
 }
 
 // Main gradient application function
-function applyGradient(colors, colorText, gradientSize) {
+function applyGradient(colors, colorText, gradientSize, mode) {
 	return new Promise((resolve) => {
-		const allParagraphs = document.querySelectorAll('p, article p, main p, .content p, .post p, .article p');
+		const allParagraphs = document.querySelectorAll([
+			// General articles / pages
+			'article p', 'main p', '.content p', '.post p', '.article p', 'p',
+			// Lists and quotes (often used instead of <p>)
+			'li', 'blockquote',
+			// ChatGPT (message content is usually rendered under .markdown)
+			'.markdown p', '.markdown li', '.markdown blockquote',
+			// Gmail (email body container)
+			'div.a3s p', 'div.a3s li', 'div.a3s blockquote'
+		].join(','));
 		const paragraphs = Array.from(allParagraphs).slice(0, MAX_PARAGRAPHS);
-		
+
 		if (paragraphs.length === 0) {
 			resolve();
 			return;
 		}
-		
+
 		const baseColor = hex_to_rgb(colorText);
-		
+
 		// Start processing on next animation frame for smooth rendering
 		requestAnimationFrame(() => {
-			processBatch(paragraphs, 0, colors, baseColor, gradientSize, 0, resolve);
+			processBatch(paragraphs, 0, colors, baseColor, gradientSize, 0, resolve, mode);
 		});
 	});
 }
@@ -119,22 +142,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 		sendResponse({ status: "ok" });
 		return true;
 	}
-	
+
 	if (message.command === "apply_gradient" || message.command === "reset") {
 		if (isProcessing) {
 			sendResponse({ status: "busy" });
 			return true;
 		}
-		
+
 		isProcessing = true;
-		const colors = message.command === "reset" 
-			? [message.color_text] 
+		const colors = message.command === "reset"
+			? [message.color_text]
 			: message.colors;
-		const gradientSize = message.command === "reset" 
-			? 0 
+		const gradientSize = message.command === "reset"
+			? 0
 			: message.gradient_size;
-		
-		applyGradient(colors, message.color_text, gradientSize)
+
+		applyGradient(colors, message.color_text, gradientSize, message.command === "reset" ? "reset" : "apply")
 			.then(() => {
 				isProcessing = false;
 				sendResponse({ status: "ok" });
@@ -143,10 +166,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 				isProcessing = false;
 				sendResponse({ status: "error", message: error.message });
 			});
-		
+
 		return true;
 	}
-	
+
 	return false;
 });
 
