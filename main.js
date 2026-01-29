@@ -1,253 +1,343 @@
 (function () {
-'use strict';
+  'use strict';
 
-// Configuration
-const MAX_NODES = 400;     // was MAX_PARAGRAPHS; now we target more than <p>
-const BATCH_SIZE = 20;
-const GRADIENT_STEPS = 10;
+  // Configuration
+  const MAX_NODES = 400;
+  const BATCH_SIZE = 20;
+  const GRADIENT_STEPS = 10;
 
-// Cache for parsed colors
-const colorCache = new Map();
+  // Cache for parsed colors
+  const colorCache = new Map();
 
-// State for SPA pages (ChatGPT, Gmail)
-let lastApply = null;      // { colors, colorText, gradientSize }
-let observer = null;
-let reapplyTimer = null;
+  // SPA support
+  let lastApply = null;      // { colors, colorText, gradientSize }
+  let observer = null;
+  let reapplyTimer = null;
 
-// Parse hex to RGB with caching
-function hex_to_rgb(hex) {
-  if (colorCache.has(hex)) return colorCache.get(hex);
-  const result = [
-    parseInt(hex.slice(1, 3), 16),
-    parseInt(hex.slice(3, 5), 16),
-    parseInt(hex.slice(5, 7), 16)
-  ];
-  colorCache.set(hex, result);
-  return result;
-}
+  // Processing / queuing
+  let isProcessing = false;
+  let pendingApply = null;
 
-// Pre-compute gradient colors for a line
-function computeGradientColors(baseColor, activeColor, steps, gradientSize) {
-  const colors = new Array(steps);
-  const factor = gradientSize / 50;
+  // Cancellation token: increment to cancel in-flight work
+  let generation = 0;
 
-  for (let i = 0; i < steps; i++) {
-    const t = 1 - (i / ((steps - 1) * factor || 1));
-    const r = (baseColor[0] * (1 - t) + activeColor[0] * t) | 0;
-    const g = (baseColor[1] * (1 - t) + activeColor[1] * t) | 0;
-    const b = (baseColor[2] * (1 - t) + activeColor[2] * t) | 0;
-    colors[i] = `rgb(${r},${g},${b})`;
+  // -------------------------
+  // Color helpers
+  // -------------------------
+  function hex_to_rgb(hex) {
+    if (colorCache.has(hex)) return colorCache.get(hex);
+    const result = [
+      parseInt(hex.slice(1, 3), 16),
+      parseInt(hex.slice(3, 5), 16),
+      parseInt(hex.slice(5, 7), 16)
+    ];
+    colorCache.set(hex, result);
+    return result;
   }
-  return colors;
-}
 
-// Apply colors to a line of spans
-function colorLine(spans, gradientColors, reverse) {
-  const len = spans.length;
-  const colorLen = gradientColors.length;
+  function computeGradientColors(baseColor, activeColor, steps, gradientSize) {
+    const colors = new Array(steps);
+    const factor = (Number.isFinite(gradientSize) ? gradientSize : 50) / 50;
+    const denom = ((steps - 1) * factor) || 1;
 
-  for (let i = 0; i < len; i++) {
-    const idx = reverse ? len - 1 - i : i;
-    const colorIdx = Math.min(Math.floor(i * colorLen / len), colorLen - 1);
-
-    const el = spans[idx];
-
-    // Save original inline color once (empty string means "none")
-    if (el.dataset.wasplineOrigColor === undefined) {
-      el.dataset.wasplineOrigColor = el.style.color || "";
+    for (let i = 0; i < steps; i++) {
+      const t = 1 - (i / denom);
+      const r = (baseColor[0] * (1 - t) + activeColor[0] * t) | 0;
+      const g = (baseColor[1] * (1 - t) + activeColor[1] * t) | 0;
+      const b = (baseColor[2] * (1 - t) + activeColor[2] * t) | 0;
+      colors[i] = `rgb(${r},${g},${b})`;
     }
-
-    el.style.color = gradientColors[colorIdx];
-  }
-}
-
-// Reset: restore original inline colors or remove our override
-function resetColors() {
-  const spans = document.querySelectorAll('span[data-waspline-orig-color]');
-  for (const s of spans) {
-    const orig = s.dataset.wasplineOrigColor;
-
-    if (orig === "") {
-      s.style.removeProperty('color');
-    } else {
-      s.style.color = orig;
-    }
-    delete s.dataset.wasplineOrigColor;
+    return colors;
   }
 
-  // Clear processed markers so apply can work cleanly next time
-  const nodes = document.querySelectorAll('[data-waspline-processed="1"]');
-  for (const n of nodes) {
-    delete n.dataset.wasplineProcessed;
+  // -------------------------
+  // DOM targeting
+  // -------------------------
+  function getTargetNodes() {
+    const selector = [
+      'article p', 'main p', '.content p', '.post p', '.article p', 'p',
+      'li', 'blockquote',
+
+      // ChatGPT-ish
+      '.markdown p', '.markdown li', '.markdown blockquote',
+      '.prose p', '.prose li', '.prose blockquote',
+      '[data-message-author-role] p', '[data-message-author-role] li', '[data-message-author-role] blockquote',
+
+      // Gmail body
+      'div.a3s p', 'div.a3s li', 'div.a3s blockquote'
+    ].join(',');
+
+    const all = document.querySelectorAll(selector);
+    return Array.from(all).slice(0, MAX_NODES);
   }
-}
 
-// Process nodes in batches using requestAnimationFrame
-function processBatch(nodes, startIdx, colors, baseColor, gradientSize, lineno, resolve) {
-  const endIdx = Math.min(startIdx + BATCH_SIZE, nodes.length);
-  const activeColors = colors.map(c => hex_to_rgb(c));
+  // -------------------------
+  // Original color capture / restore
+  // -------------------------
+  function ensureOriginalColorCaptured(el) {
+    if (!el || !el.dataset) return;
+    if (el.dataset.wasplineOrigComputed !== undefined) return;
 
-  for (let i = startIdx; i < endIdx; i++) {
-    const node = nodes[i];
+    const inline = el.style.color || '';
+    const hadInline = inline !== '' ? '1' : '0';
 
-    // Skip empty/small
-    if (!node.textContent || node.textContent.trim().length < 2) continue;
+    let computed = '';
+    try { computed = getComputedStyle(el).color || ''; } catch (_) { computed = ''; }
 
-    // Skip code blocks (ChatGPT)
-    if (node.closest && node.closest('pre, code')) continue;
+    el.dataset.wasplineOrigInline = inline;
+    el.dataset.wasplineHadInline = hadInline;
+    el.dataset.wasplineOrigComputed = computed;
+  }
 
-    // Avoid reprocessing the same node repeatedly (important on SPA pages)
-    if (node.dataset.wasplineProcessed === '1') continue;
-    node.dataset.wasplineProcessed = '1';
+  function resetColors() {
+    const touched = document.querySelectorAll(
+      '[data-waspline-orig-computed], [data-waspline-orig-inline], [data-waspline-had-inline]'
+    );
 
-    try {
-      const lines = lineWrapDetector.getLines(node);
+    for (const el of touched) {
+      const hadInline = el.dataset.wasplineHadInline === '1';
+      const origInline = el.dataset.wasplineOrigInline ?? '';
 
-      for (const line of lines) {
-        if (!line || line.length === 0) continue;
+      el.style.removeProperty('color');
 
-        const colorIdx = Math.floor(lineno / 2) % activeColors.length;
-        const isLeft = (lineno % 2 === 0);
-
-        const gradientColors = computeGradientColors(
-          baseColor,
-          activeColors[colorIdx],
-          Math.min(line.length, GRADIENT_STEPS),
-          gradientSize
-        );
-
-        colorLine(line, gradientColors, isLeft);
-        lineno++;
+      if (hadInline) {
+        if (origInline === '') el.style.removeProperty('color');
+        else el.style.color = origInline;
       }
-    } catch (e) {
-      // Skip failed nodes
+
+      delete el.dataset.wasplineOrigInline;
+      delete el.dataset.wasplineHadInline;
+      delete el.dataset.wasplineOrigComputed;
+    }
+
+    const nodes = document.querySelectorAll('[data-waspline-processed="1"]');
+    for (const n of nodes) delete n.dataset.wasplineProcessed;
+  }
+
+  // -------------------------
+  // Coloring logic
+  // -------------------------
+  function colorLine(spans, gradientColors, reverse) {
+    const len = spans.length;
+    const colorLen = gradientColors.length;
+
+    for (let i = 0; i < len; i++) {
+      const idx = reverse ? (len - 1 - i) : i;
+      const colorIdx = Math.min(Math.floor(i * colorLen / len), colorLen - 1);
+      const el = spans[idx];
+      if (!el) continue;
+
+      ensureOriginalColorCaptured(el);
+      el.style.color = gradientColors[colorIdx];
     }
   }
 
-  if (endIdx < nodes.length) {
-    requestAnimationFrame(() => {
-      processBatch(nodes, endIdx, colors, baseColor, gradientSize, lineno, resolve);
-    });
-  } else {
-    resolve();
-  }
-}
-
-// Build a good list of text nodes to process across sites
-function getTargetNodes() {
-  const selector = [
-    // General pages
-    'article p', 'main p', '.content p', '.post p', '.article p', 'p',
-    'li', 'blockquote',
-
-    // ChatGPT (varies across UI versions)
-    '.markdown p', '.markdown li', '.markdown blockquote',
-    '.prose p', '.prose li', '.prose blockquote',
-    '[data-message-author-role] p', '[data-message-author-role] li', '[data-message-author-role] blockquote',
-
-    // Gmail email body container
-    'div.a3s p', 'div.a3s li', 'div.a3s blockquote'
-  ].join(',');
-
-  const all = document.querySelectorAll(selector);
-  return Array.from(all).slice(0, MAX_NODES);
-}
-
-// Main gradient application function
-function applyGradient(colors, colorText, gradientSize) {
-  return new Promise((resolve) => {
-    const nodes = getTargetNodes();
-
-    if (nodes.length === 0) {
+  function processBatch(nodes, startIdx, colors, baseColor, gradientSize, lineno, resolve, myGen) {
+    // Cancel if generation changed
+    if (myGen !== generation) {
       resolve();
       return;
     }
 
-    const baseColor = hex_to_rgb(colorText);
+    const endIdx = Math.min(startIdx + BATCH_SIZE, nodes.length);
+    const activeColors = colors.map(c => hex_to_rgb(c));
 
-    requestAnimationFrame(() => {
-      processBatch(nodes, 0, colors, baseColor, gradientSize, 0, resolve);
-    });
-  });
-}
+    for (let i = startIdx; i < endIdx; i++) {
+      if (myGen !== generation) {
+        resolve();
+        return;
+      }
 
-// SPA observer: re-apply while enabled to handle ChatGPT/Gmail re-renders
-function startObserver() {
-  if (observer) return;
+      const node = nodes[i];
+      if (!node || !node.textContent || node.textContent.trim().length < 2) continue;
+      if (node.closest && node.closest('pre, code')) continue;
 
-  observer = new MutationObserver(() => {
-    if (!lastApply) return;
+      if (node.dataset.wasplineProcessed === '1') continue;
+      node.dataset.wasplineProcessed = '1';
 
-    clearTimeout(reapplyTimer);
-    reapplyTimer = setTimeout(() => {
-      // Clear processed markers before reapplying (because DOM may have changed)
-      const nodes = document.querySelectorAll('[data-waspline-processed="1"]');
-      for (const n of nodes) delete n.dataset.wasplineProcessed;
+      try {
+        const lines = lineWrapDetector.getLines(node);
 
-      applyGradient(lastApply.colors, lastApply.colorText, lastApply.gradientSize);
-    }, 250);
-  });
+        for (const line of lines) {
+          if (myGen !== generation) {
+            resolve();
+            return;
+          }
 
-  observer.observe(document.documentElement, { childList: true, subtree: true });
-}
+          if (!line || line.length === 0) continue;
 
-function stopObserver() {
-  if (!observer) return;
-  observer.disconnect();
-  observer = null;
-  clearTimeout(reapplyTimer);
-  reapplyTimer = null;
-}
+          const colorIdx = Math.floor(lineno / 2) % activeColors.length;
+          const isLeft = (lineno % 2 === 0);
 
-// Track processing state to avoid piling up work
-let isProcessing = false;
+          const gradientColors = computeGradientColors(
+            baseColor,
+            activeColors[colorIdx],
+            Math.min(line.length, GRADIENT_STEPS),
+            gradientSize
+          );
 
-// Message listener
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.command === "ping") {
-    sendResponse({ status: "ok" });
-    return true;
-  }
-
-  if (message.command === "reset") {
-    // Stop SPA behavior and restore original colors
-    lastApply = null;
-    stopObserver();
-    resetColors();
-    sendResponse({ status: "ok" });
-    return true;
-  }
-
-  if (message.command === "apply_gradient") {
-    if (isProcessing) {
-      sendResponse({ status: "busy" });
-      return true;
+          colorLine(line, gradientColors, isLeft);
+          lineno++;
+        }
+      } catch (_) { /* ignore */ }
     }
+
+    if (endIdx < nodes.length) {
+      requestAnimationFrame(() => {
+        processBatch(nodes, endIdx, colors, baseColor, gradientSize, lineno, resolve, myGen);
+      });
+    } else {
+      resolve();
+    }
+  }
+
+  function applyGradient(colors, colorText, gradientSize, myGen) {
+    return new Promise((resolve) => {
+      if (myGen !== generation) {
+        resolve();
+        return;
+      }
+
+      const nodes = getTargetNodes();
+      if (nodes.length === 0) {
+        resolve();
+        return;
+      }
+
+      const baseColor = hex_to_rgb(colorText);
+
+      requestAnimationFrame(() => {
+        processBatch(nodes, 0, colors, baseColor, gradientSize, 0, resolve, myGen);
+      });
+    });
+  }
+
+  // -------------------------
+  // SPA observer
+  // -------------------------
+  function startObserver() {
+    if (observer) return;
+
+    observer = new MutationObserver(() => {
+      if (!lastApply) return;
+
+      clearTimeout(reapplyTimer);
+      reapplyTimer = setTimeout(() => {
+        // Top-up only; do not reset
+        const nodes = document.querySelectorAll('[data-waspline-processed="1"]');
+        for (const n of nodes) delete n.dataset.wasplineProcessed;
+
+        enqueueApply({
+          colors: lastApply.colors,
+          color_text: lastApply.colorText,
+          gradient_size: lastApply.gradientSize,
+          mode: 'spa_topup'
+        });
+      }, 250);
+    });
+
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  function stopObserver() {
+    if (!observer) return;
+    observer.disconnect();
+    observer = null;
+    clearTimeout(reapplyTimer);
+    reapplyTimer = null;
+  }
+
+  // -------------------------
+  // Apply queuing
+  // -------------------------
+  function sameSettings(last, msg) {
+    if (!last || !msg) return false;
+    const lc = Array.isArray(last.colors) ? last.colors.join(',') : '';
+    const mc = Array.isArray(msg.colors) ? msg.colors.join(',') : '';
+    return lc === mc &&
+      String(last.colorText) === String(msg.color_text) &&
+      Number(last.gradientSize) === Number(msg.gradient_size);
+  }
+
+  function enqueueApply(msg) {
+    if (!msg) return;
+    pendingApply = msg;
+    if (!isProcessing) void drainQueue();
+  }
+
+  async function drainQueue() {
+    if (isProcessing) return;
+    if (!pendingApply) return;
+
+    const msg = pendingApply;
+    pendingApply = null;
 
     isProcessing = true;
 
-    // Save for SPA re-apply (ChatGPT/Gmail)
-    lastApply = {
-      colors: message.colors,
-      colorText: message.color_text,
-      gradientSize: message.gradient_size
-    };
-    startObserver();
+    // Snapshot generation for this run
+    const myGen = generation;
 
-    applyGradient(message.colors, message.color_text, message.gradient_size)
-      .then(() => {
-        isProcessing = false;
-        sendResponse({ status: "ok" });
-      })
-      .catch((error) => {
-        isProcessing = false;
-        sendResponse({ status: "error", message: error.message });
-      });
+    try {
+      const colors = Array.isArray(msg.colors) ? msg.colors : [];
+      const colorText = String(msg.color_text || '#000000');
+      const gradientSize = Number(msg.gradient_size);
 
-    return true;
+      lastApply = { colors, colorText, gradientSize };
+      startObserver();
+
+      if (msg.mode !== 'spa_topup') {
+        // Clean recolor for explicit Apply
+        resetColors();
+      }
+
+      await applyGradient(colors, colorText, gradientSize, myGen);
+    } finally {
+      isProcessing = false;
+      if (pendingApply) void drainQueue();
+    }
   }
 
-  return false;
-});
+  // -------------------------
+  // Message listener
+  // -------------------------
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.command === "ping") {
+      sendResponse({ status: "ok" });
+      return true;
+    }
+
+    if (message.command === "reset") {
+      // Cancel any in-flight apply immediately
+      generation++;
+      pendingApply = null;
+      lastApply = null;
+      stopObserver();
+      resetColors();
+      sendResponse({ status: "ok" });
+      return true;
+    }
+
+    if (message.command === "apply_gradient") {
+      const msg = {
+        colors: message.colors,
+        color_text: message.color_text,
+        gradient_size: message.gradient_size,
+        mode: 'apply'
+      };
+
+      if (sameSettings(lastApply, msg)) {
+        sendResponse({ status: "ok", note: "no_change" });
+        return true;
+      }
+
+      // New apply supersedes old: cancel in-flight work then queue
+      generation++;
+      enqueueApply(msg);
+      sendResponse({ status: "queued" });
+      return true;
+    }
+
+    return false;
+  });
 
 })();

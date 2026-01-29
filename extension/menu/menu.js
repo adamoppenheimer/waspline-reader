@@ -5,11 +5,22 @@ const color1 = document.getElementById('color1');
 const color2 = document.getElementById('color2');
 const color_text = document.getElementById('color_text');
 const gradient_size = document.getElementById('gradient_size');
-const enabled = document.getElementById('enabled');
+
+const btnApply = document.getElementById('apply');
+const btnRestore = document.getElementById('restore');
 
 const btnSaveMyDefault = document.getElementById('save-my-default');
 const btnResetMyDefault = document.getElementById('reset-my-default');
 const btnResetExtDefault = document.getElementById('reset-ext-default');
+
+const popupContent = document.getElementById('popup-content');
+const errorContent = document.getElementById('error-content');
+
+// Defensive binder
+function bind(el, eventName, handler) {
+  if (!el) return;
+  el.addEventListener(eventName, handler);
+}
 
 // ----- helpers -----
 function isRestrictedUrl(url) {
@@ -25,12 +36,24 @@ function isRestrictedUrl(url) {
     url.startsWith('data:');
 }
 
-function setEnabledAllowed(allowed, reason) {
-  enabled.disabled = !allowed;
-  enabled.title = allowed ? '' : (reason || "This extension can't run on this page.");
+function setButtonAllowed(btn, allowed, reason) {
+  if (!btn) return;
+  btn.disabled = !allowed;
+  btn.title = allowed ? '' : (reason || "This extension can't run on this page.");
 }
 
-// MV3 “real” check: can Chrome inject scripts into this tab?
+function showPopup(ok) {
+  if (!popupContent || !errorContent) return;
+  if (ok) {
+    popupContent.classList.remove('hidden');
+    errorContent.classList.add('hidden');
+  } else {
+    popupContent.classList.add('hidden');
+    errorContent.classList.remove('hidden');
+  }
+}
+
+// MV3 injection check on active tab
 function canInjectIntoTab(tabId) {
   return new Promise((resolve) => {
     chrome.scripting.executeScript(
@@ -42,123 +65,194 @@ function canInjectIntoTab(tabId) {
 
 async function getActiveTab() {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  return tabs && tabs[0] ? tabs[0] : null;
+  return tabs?.[0] || null;
 }
 
 function readSettingsFromUI() {
   return {
-    color1: color1.value,
-    color2: color2.value,
-    color_text: color_text.value,
-    gradient_size: Number(gradient_size.value)
+    color1: color1?.value ?? "#0000FF",
+    color2: color2?.value ?? "#FF0000",
+    color_text: color_text?.value ?? "#000000",
+    gradient_size: Number(gradient_size?.value ?? 50)
   };
 }
 
 function writeSettingsToUI(settings) {
-  color1.value = settings.color1;
-  color2.value = settings.color2;
-  color_text.value = settings.color_text;
-  gradient_size.value = settings.gradient_size;
+  if (!settings) return;
+  if (color1) color1.value = settings.color1 ?? "#0000FF";
+  if (color2) color2.value = settings.color2 ?? "#FF0000";
+  if (color_text) color_text.value = settings.color_text ?? "#000000";
+  if (gradient_size) gradient_size.value = String(settings.gradient_size ?? 50);
 }
 
-// Pull current tab info from background
+function settingsEqual(a, b) {
+  if (!a || !b) return false;
+  return String(a.color1) === String(b.color1) &&
+    String(a.color2) === String(b.color2) &&
+    String(a.color_text) === String(b.color_text) &&
+    Number(a.gradient_size) === Number(b.gradient_size);
+}
+
 async function getTabInfo(tabId) {
   return await chrome.runtime.sendMessage({ type: "GET_TAB_INFO", tabId });
 }
 
+// ----- state -----
+let lastInfo = null;   // { enabled, settings, appliedSettings, ... }
+let lastTabId = null;
+let lastAllowed = false;
+
+// ----- UI state -----
+function refreshButtons() {
+  const notAllowedReason = "Chrome blocked script injection on this site.";
+  setButtonAllowed(btnApply, lastAllowed, notAllowedReason);
+  setButtonAllowed(btnRestore, lastAllowed, notAllowedReason);
+
+  if (!lastAllowed) return;
+
+  const ui = readSettingsFromUI();
+  const applied = !!lastInfo?.enabled;
+  const appliedSettings = lastInfo?.appliedSettings; // IMPORTANT: separate from selected
+
+  // Restore only if something is applied
+  setButtonAllowed(btnRestore, applied, applied ? "" : "Nothing to restore.");
+
+  // Apply if not applied yet, or UI differs from what is currently applied
+  const canApply = !applied || !settingsEqual(ui, appliedSettings);
+  setButtonAllowed(btnApply, canApply, canApply ? "" : "These settings are already applied.");
+}
+
+// ----- init / sync -----
 async function syncUIToCurrentTab() {
   const tab = await getActiveTab();
-  if (!tab) return;
+  if (!tab) {
+    showPopup(false);
+    lastAllowed = false;
+    refreshButtons();
+    return;
+  }
 
-  // Restriction checks
+  lastTabId = tab.id;
+
   if (isRestrictedUrl(tab.url)) {
-    enabled.checked = false;
-    setEnabledAllowed(false, "Not allowed on this type of page.");
+    showPopup(false);
+    lastAllowed = false;
+    refreshButtons();
     return;
   }
 
   const ok = await canInjectIntoTab(tab.id);
   if (!ok) {
-    enabled.checked = false;
-    setEnabledAllowed(false, "Chrome blocked script injection on this site.");
+    showPopup(false);
+    lastAllowed = false;
+    refreshButtons();
     return;
   }
 
-  setEnabledAllowed(true);
+  showPopup(true);
+  lastAllowed = true;
 
-  const info = await getTabInfo(tab.id);
-  if (!info?.ok) return;
+  lastInfo = await getTabInfo(tab.id);
+  if (lastInfo?.ok) {
+    // Fill UI with selected settings for this tab (not necessarily applied)
+    writeSettingsToUI(lastInfo.settings);
+  }
 
-  enabled.checked = !!info.enabled;
-  writeSettingsToUI(info.settings);
+  refreshButtons();
 }
 
-// ----- behavior: any setting change updates this tab immediately (if enabled) -----
-async function onSettingChanged(e) {
+// ----- settings changes: store selected settings only -----
+async function onSettingsChanged() {
+  if (!lastAllowed || typeof lastTabId !== "number") {
+    refreshButtons();
+    return;
+  }
+
+  const settings = readSettingsFromUI();
+
+  await chrome.runtime.sendMessage({
+    type: "SET_TAB_SETTINGS",
+    tabId: lastTabId,
+    settings
+  });
+
+  // Update local cache: selected settings changed, appliedSettings unchanged
+  if (lastInfo?.ok) lastInfo.settings = settings;
+
+  refreshButtons();
+}
+
+// ----- Apply / Restore -----
+async function onApply() {
   const tab = await getActiveTab();
   if (!tab) return;
 
   if (isRestrictedUrl(tab.url) || !(await canInjectIntoTab(tab.id))) {
-    enabled.checked = false;
-    setEnabledAllowed(false, "This extension can't run on this page.");
+    lastAllowed = false;
+    showPopup(false);
+    refreshButtons();
     return;
   }
-  setEnabledAllowed(true);
+
+  lastAllowed = true;
+  showPopup(true);
 
   const settings = readSettingsFromUI();
 
-  // Save settings to this tab (does not affect other tabs)
+  // Persist selected settings first
   await chrome.runtime.sendMessage({
     type: "SET_TAB_SETTINGS",
     tabId: tab.id,
     settings
   });
 
-  // If enabled checkbox is ON, bg.js will apply immediately after SET_TAB_SETTINGS.
-  // If OFF, it just stores the per-tab settings for next time you enable.
-}
-
-// ----- behavior: toggle enabled for this tab -----
-async function onEnabledToggled(e) {
-  const tab = await getActiveTab();
-  if (!tab) return;
-
-  if (isRestrictedUrl(tab.url) || !(await canInjectIntoTab(tab.id))) {
-    enabled.checked = false;
-    setEnabledAllowed(false, "This extension can't run on this page.");
-    return;
-  }
-  setEnabledAllowed(true);
-
-  // Ensure bg has latest settings for this tab before enabling
-  const settings = readSettingsFromUI();
-  await chrome.runtime.sendMessage({
-    type: "SET_TAB_SETTINGS",
-    tabId: tab.id,
-    settings
-  });
-
+  // Apply to page
   const res = await chrome.runtime.sendMessage({
     type: "SET_TAB_ENABLED",
     tabId: tab.id,
-    enabled: enabled.checked
+    enabled: true
   });
 
-  if (enabled.checked && (!res || !res.ok)) {
-    enabled.checked = false;
-    const reason =
-      res && res.reason === "restricted" ? "Not allowed on this type of page." :
-      res && res.reason === "inject_failed" ? "Chrome blocked script injection on this site." :
-      "Could not enable on this page.";
-    setEnabledAllowed(false, reason);
+  // Refresh info for appliedSettings + enabled state
+  lastInfo = await getTabInfo(tab.id);
+  refreshButtons();
+
+  if (!res || !res.ok) {
+    if (lastInfo?.ok) {
+      lastInfo.enabled = false;
+      lastInfo.appliedSettings = null;
+    }
+    refreshButtons();
   }
 }
 
-// ----- buttons -----
+async function onRestore() {
+  const tab = await getActiveTab();
+  if (!tab) return;
+
+  if (isRestrictedUrl(tab.url) || !(await canInjectIntoTab(tab.id))) {
+    lastAllowed = false;
+    showPopup(false);
+    refreshButtons();
+    return;
+  }
+
+  lastAllowed = true;
+  showPopup(true);
+
+  await chrome.runtime.sendMessage({
+    type: "SET_TAB_ENABLED",
+    tabId: tab.id,
+    enabled: false
+  });
+
+  lastInfo = await getTabInfo(tab.id);
+  refreshButtons();
+}
+
+// ----- defaults buttons -----
 async function onSaveMyDefault() {
   const settings = readSettingsFromUI();
-
-  // Save global user default (does not affect other tabs)
   await chrome.runtime.sendMessage({
     type: "SET_USER_DEFAULTS",
     userDefaults: settings
@@ -177,6 +271,7 @@ async function onResetMyDefault() {
 
   if (res?.ok && res.settings) {
     writeSettingsToUI(res.settings);
+    await onSettingsChanged();
   }
 }
 
@@ -192,6 +287,7 @@ async function onResetExtDefault() {
 
   if (res?.ok && res.settings) {
     writeSettingsToUI(res.settings);
+    await onSettingsChanged();
   }
 }
 
@@ -200,15 +296,17 @@ async function onResetExtDefault() {
   await syncUIToCurrentTab();
 })();
 
-// ----- listeners -----
-enabled.addEventListener("change", onEnabledToggled);
+// Controls changes do not auto-apply
+bind(gradient_size, "input", onSettingsChanged);
+bind(color1, "input", onSettingsChanged);
+bind(color2, "input", onSettingsChanged);
+bind(color_text, "input", onSettingsChanged);
 
-gradient_size.addEventListener("change", onSettingChanged);
-color1.addEventListener("change", onSettingChanged);
-color2.addEventListener("change", onSettingChanged);
-color_text.addEventListener("change", onSettingChanged);
+// Apply / Restore
+bind(btnApply, "click", onApply);
+bind(btnRestore, "click", onRestore);
 
-// Buttons
-btnSaveMyDefault.addEventListener("click", onSaveMyDefault);
-btnResetMyDefault.addEventListener("click", onResetMyDefault);
-btnResetExtDefault.addEventListener("click", onResetExtDefault);
+// Defaults
+bind(btnSaveMyDefault, "click", onSaveMyDefault);
+bind(btnResetMyDefault, "click", onResetMyDefault);
+bind(btnResetExtDefault, "click", onResetExtDefault);

@@ -22,8 +22,17 @@ function isRestrictedUrl(url) {
     url.startsWith('data:');
 }
 
-// Per-tab state in session storage:
-// tabStates: { [tabId]: { enabled: boolean, settings: {color1,color2,color_text,gradient_size} } }
+/**
+ * Per-tab state in session storage:
+ * tabStates: {
+ *   [tabId]: {
+ *     enabled: boolean,               // "currently applied to page" state
+ *     settings: { ... },              // selected settings in UI for this tab
+ *     appliedSettings: { ... } | null,// settings last applied to the page
+ *     settingsIsExplicit: boolean
+ *   }
+ * }
+ */
 async function getTabStates() {
   const result = await chrome.storage.session.get({ tabStates: {} });
   return result.tabStates || {};
@@ -38,11 +47,20 @@ async function getTabState(tabId) {
 async function setTabState(tabId, patch) {
   const tabStates = await getTabStates();
   const key = String(tabId);
-  const prev = tabStates[key] || { enabled: false, settings: null };
+  const prev = tabStates[key] || {
+    enabled: false,
+    settings: null,
+    appliedSettings: null,
+    settingsIsExplicit: false
+  };
+
   tabStates[key] = {
     enabled: typeof patch.enabled === "boolean" ? patch.enabled : prev.enabled,
-    settings: patch.settings !== undefined ? patch.settings : prev.settings
+    settings: patch.settings !== undefined ? patch.settings : prev.settings,
+    appliedSettings: patch.appliedSettings !== undefined ? patch.appliedSettings : prev.appliedSettings,
+    settingsIsExplicit: typeof patch.settingsIsExplicit === "boolean" ? patch.settingsIsExplicit : prev.settingsIsExplicit
   };
+
   await setTabStates(tabStates);
 }
 async function clearTabState(tabId) {
@@ -51,13 +69,14 @@ async function clearTabState(tabId) {
   await setTabStates(tabStates);
 }
 
-// User defaults in local storage (synced across tabs)
+// User defaults in local storage
 async function getUserDefaults() {
   const result = await chrome.storage.local.get({ userDefaults: EXT_DEFAULTS });
   return result.userDefaults || EXT_DEFAULTS;
 }
 async function setUserDefaults(newDefaults) {
   await chrome.storage.local.set({ userDefaults: newDefaults });
+  return newDefaults;
 }
 
 // Injection helpers
@@ -67,7 +86,9 @@ async function ensureInjectedAllFrames(tabId) {
     files: ["contentScript.js"]
   });
 }
+
 async function sendToAllFrames(tabId, message) {
+  // Enumerate frames at send-time so deep frames (e.g., Gmail) are included.
   const frames = await chrome.webNavigation.getAllFrames({ tabId });
   await Promise.all(
     frames.map(f =>
@@ -91,8 +112,8 @@ async function resetTab(tabId) {
   await sendToAllFrames(tabId, { command: "reset" });
 }
 
-// Effective settings for a tab: tab.settings if present else userDefaults
-async function getEffectiveSettingsForTab(tabId) {
+// Effective selected settings for a tab: tab.settings if present, else userDefaults
+async function getSelectedSettingsForTab(tabId) {
   const state = await getTabState(tabId);
   if (state && state.settings) return state.settings;
   return await getUserDefaults();
@@ -102,110 +123,113 @@ async function getEffectiveSettingsForTab(tabId) {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
-      // Return current tab enabled + effective settings + user defaults + ext defaults
       if (msg?.type === "GET_TAB_INFO") {
         const tabId = msg.tabId;
         const state = await getTabState(tabId);
         const userDefaults = await getUserDefaults();
-        const effective = state?.settings || userDefaults;
+
+        const selected = state?.settings || userDefaults;
 
         sendResponse({
           ok: true,
           enabled: !!state?.enabled,
-          settings: effective,
+          settings: selected,                       // selected in UI for this tab
+          appliedSettings: state?.appliedSettings || null, // last applied to the page
           userDefaults,
           extDefaults: EXT_DEFAULTS
         });
         return;
       }
 
-      // Toggle enabled for this tab (per-tab)
+      // Apply / Restore
       if (msg?.type === "SET_TAB_ENABLED") {
         const tabId = msg.tabId;
         const desired = !!msg.enabled;
 
         const tab = await chrome.tabs.get(tabId);
         if (isRestrictedUrl(tab.url)) {
-          await setTabState(tabId, { enabled: false });
+          await setTabState(tabId, { enabled: false, appliedSettings: null });
           sendResponse({ ok: false, reason: "restricted" });
           return;
         }
 
-        // Ensure tab has settings; default to user defaults if missing
+        // Ensure tab has selected settings
         const current = await getTabState(tabId);
         if (!current?.settings) {
           const userDefaults = await getUserDefaults();
-          await setTabState(tabId, { settings: userDefaults });
+          await setTabState(tabId, { settings: userDefaults, settingsIsExplicit: false });
         }
 
-        await setTabState(tabId, { enabled: desired });
+        if (desired) {
+          const settings = await getSelectedSettingsForTab(tabId);
 
-        try {
-          if (desired) {
-            const settings = await getEffectiveSettingsForTab(tabId);
+          // Mark enabled before injection; if injection fails we roll back.
+          await setTabState(tabId, { enabled: true });
+
+          try {
             await applyToTab(tabId, settings);
-          } else {
-            await resetTab(tabId);
+            // Only update appliedSettings after a successful apply
+            await setTabState(tabId, { appliedSettings: settings });
+            sendResponse({ ok: true });
+          } catch (_) {
+            await setTabState(tabId, { enabled: false, appliedSettings: null });
+            sendResponse({ ok: false, reason: "inject_failed" });
           }
+          return;
+        } else {
+          // Restore
+          await setTabState(tabId, { enabled: false });
+          try {
+            await resetTab(tabId);
+          } catch (_) {
+            // ignore
+          }
+          // Clear applied settings after restore attempt
+          await setTabState(tabId, { appliedSettings: null });
           sendResponse({ ok: true });
-        } catch (e) {
-          // If enabling failed, revert to disabled
-          if (desired) await setTabState(tabId, { enabled: false });
-          sendResponse({ ok: false, reason: "inject_failed" });
+          return;
         }
-        return;
       }
 
-      // Update per-tab settings (does not affect other tabs)
-      // If enabled, apply immediately
+      // Update per-tab selected settings (does NOT auto-apply)
       if (msg?.type === "SET_TAB_SETTINGS") {
         const tabId = msg.tabId;
         const newSettings = msg.settings;
+        await setTabState(tabId, { settings: newSettings, settingsIsExplicit: true });
+        sendResponse({ ok: true });
+        return;
+      }
 
-        await setTabState(tabId, { settings: newSettings });
+      // Save user defaults (global). Does not auto-apply.
+      if (msg?.type === "SET_USER_DEFAULTS") {
+        const saved = await setUserDefaults(msg.userDefaults);
 
-        const state = await getTabState(tabId);
-        if (state?.enabled) {
-          const tab = await chrome.tabs.get(tabId);
-          if (!isRestrictedUrl(tab.url)) {
-            try {
-              await applyToTab(tabId, newSettings);
-            } catch (_) {
-              // If apply fails, silently keep settings but do not crash
-            }
+        // Keep current tab controls aligned if not explicitly customized.
+        const tabId = sender?.tab?.id;
+        if (typeof tabId === "number") {
+          const state = await getTabState(tabId);
+          const isExplicit = !!state?.settingsIsExplicit;
+          if (!isExplicit) {
+            await setTabState(tabId, { settings: saved, settingsIsExplicit: false });
           }
         }
 
-        sendResponse({ ok: true });
+        sendResponse({ ok: true, userDefaults: saved });
         return;
       }
 
-      // Save user defaults (global)
-      if (msg?.type === "SET_USER_DEFAULTS") {
-        await setUserDefaults(msg.userDefaults);
-        sendResponse({ ok: true });
-        return;
-      }
-
-      // Reset current tab settings to "user" or "ext" defaults (and apply if enabled)
+      // Reset selected controls for this tab to defaults (user or extension). Does not auto-apply.
       if (msg?.type === "RESET_TAB_TO_DEFAULTS") {
         const tabId = msg.tabId;
         const which = msg.which; // "user" | "ext"
-
         const defaults = which === "ext" ? EXT_DEFAULTS : await getUserDefaults();
-        await setTabState(tabId, { settings: defaults });
-
-        const state = await getTabState(tabId);
-        if (state?.enabled) {
-          try { await applyToTab(tabId, defaults); } catch (_) {}
-        }
-
+        await setTabState(tabId, { settings: defaults, settingsIsExplicit: false });
         sendResponse({ ok: true, settings: defaults });
         return;
       }
 
       sendResponse({ ok: false, reason: "unknown_message" });
-    } catch (e) {
+    } catch (_) {
       sendResponse({ ok: false, reason: "internal_error" });
     }
   })();
@@ -213,11 +237,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true;
 });
 
-// ----- your preference: disable on refresh/navigation -----
-chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+// ----- preference: disable on refresh/navigation -----
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (changeInfo.status !== "complete") return;
-  // Always turn off on navigation/refresh
-  await setTabState(tabId, { enabled: false });
+  // Invalidate "applied" state (page refreshed)
+  await setTabState(tabId, { enabled: false, appliedSettings: null });
 });
 
 // Cleanup on close
