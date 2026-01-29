@@ -16,6 +16,9 @@ const btnResetExtDefault = document.getElementById('reset-ext-default');
 const popupContent = document.getElementById('popup-content');
 const errorContent = document.getElementById('error-content');
 
+const toast = document.getElementById('toast');
+let toastTimer = null;
+
 // Defensive binder
 function bind(el, eventName, handler) {
   if (!el) return;
@@ -97,6 +100,37 @@ async function getTabInfo(tabId) {
   return await chrome.runtime.sendMessage({ type: "GET_TAB_INFO", tabId });
 }
 
+// Toast UI
+function hideToast() {
+  if (!toast) return;
+  toast.classList.add('hidden');
+}
+
+function showToast(message, duration = 1500) {
+  if (!toast) return;
+
+  toast.textContent = message;
+
+  // Ensure clean state
+  toast.classList.remove('hidden');
+  toast.classList.remove('visible');
+
+  // Allow DOM to apply initial styles
+  requestAnimationFrame(() => {
+    toast.classList.add('visible');
+  });
+
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    toast.classList.remove('visible');
+
+    // Wait for fade-out to finish before hiding completely
+    setTimeout(() => {
+      toast.classList.add('hidden');
+    }, 200); // must match CSS transition duration
+  }, duration);
+}
+
 // ----- state -----
 let lastInfo = null;   // { enabled, settings, appliedSettings, ... }
 let lastTabId = null;
@@ -112,18 +146,18 @@ function refreshButtons() {
 
   const ui = readSettingsFromUI();
   const applied = !!lastInfo?.enabled;
-  const appliedSettings = lastInfo?.appliedSettings; // IMPORTANT: separate from selected
+  const appliedSettings = lastInfo?.appliedSettings;
 
-  // Restore only if something is applied
   setButtonAllowed(btnRestore, applied, applied ? "" : "Nothing to restore.");
 
-  // Apply if not applied yet, or UI differs from what is currently applied
   const canApply = !applied || !settingsEqual(ui, appliedSettings);
   setButtonAllowed(btnApply, canApply, canApply ? "" : "These settings are already applied.");
 }
 
 // ----- init / sync -----
 async function syncUIToCurrentTab() {
+  hideToast();
+
   const tab = await getActiveTab();
   if (!tab) {
     showPopup(false);
@@ -153,10 +187,7 @@ async function syncUIToCurrentTab() {
   lastAllowed = true;
 
   lastInfo = await getTabInfo(tab.id);
-  if (lastInfo?.ok) {
-    // Fill UI with selected settings for this tab (not necessarily applied)
-    writeSettingsToUI(lastInfo.settings);
-  }
+  if (lastInfo?.ok) writeSettingsToUI(lastInfo.settings);
 
   refreshButtons();
 }
@@ -176,7 +207,6 @@ async function onSettingsChanged() {
     settings
   });
 
-  // Update local cache: selected settings changed, appliedSettings unchanged
   if (lastInfo?.ok) lastInfo.settings = settings;
 
   refreshButtons();
@@ -199,21 +229,18 @@ async function onApply() {
 
   const settings = readSettingsFromUI();
 
-  // Persist selected settings first
   await chrome.runtime.sendMessage({
     type: "SET_TAB_SETTINGS",
     tabId: tab.id,
     settings
   });
 
-  // Apply to page
   const res = await chrome.runtime.sendMessage({
     type: "SET_TAB_ENABLED",
     tabId: tab.id,
     enabled: true
   });
 
-  // Refresh info for appliedSettings + enabled state
   lastInfo = await getTabInfo(tab.id);
   refreshButtons();
 
@@ -253,10 +280,13 @@ async function onRestore() {
 // ----- defaults buttons -----
 async function onSaveMyDefault() {
   const settings = readSettingsFromUI();
-  await chrome.runtime.sendMessage({
+  const res = await chrome.runtime.sendMessage({
     type: "SET_USER_DEFAULTS",
     userDefaults: settings
   });
+
+  if (res?.ok) showToast("Saved!", 1500);
+  else showToast("Save failed", 1600);
 }
 
 async function onResetMyDefault() {
