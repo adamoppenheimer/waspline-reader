@@ -1,78 +1,136 @@
+// bg.js (MV3 service worker)
 
-// Check if URL is restricted (cannot inject content scripts)
+// ---------- helpers ----------
 function isRestrictedUrl(url) {
-	if (!url) return true;
-	return url.startsWith('chrome://') ||
-		url.startsWith('chrome-extension://') ||
-		url.startsWith('edge://') ||
-		url.startsWith('about:') ||
-		url.startsWith('moz-extension://') ||
-		url.startsWith('file://') ||
-		url.startsWith('devtools://') ||
-		url.startsWith('view-source:') ||
-		url.startsWith('data:');
+  if (!url) return true;
+  return url.startsWith('chrome://') ||
+    url.startsWith('chrome-extension://') ||
+    url.startsWith('edge://') ||
+    url.startsWith('about:') ||
+    url.startsWith('moz-extension://') ||
+    url.startsWith('file://') ||
+    url.startsWith('devtools://') ||
+    url.startsWith('view-source:') ||
+    url.startsWith('data:');
 }
 
-// Extract domain from URL
-function getDomainFromUrl(url) {
-	try {
-		const urlObj = new URL(url);
-		return urlObj.hostname;
-	} catch (e) {
-		return null;
-	}
+// Per-tab enabled state stored in session (clears when browser closes)
+async function getEnabledTabs() {
+  const result = await chrome.storage.session.get({ enabledTabs: {} });
+  return result.enabledTabs || {};
 }
 
-// Check if domain is in blacklist
-async function isDomainBlacklisted(domain) {
-	if (!domain) return false;
-	const result = await chrome.storage.local.get({ domainBlacklist: [] });
-	return result.domainBlacklist.includes(domain);
+async function setTabEnabled(tabId, enabled) {
+  const enabledTabs = await getEnabledTabs();
+  const key = String(tabId);
+
+  if (enabled) enabledTabs[key] = true;
+  else delete enabledTabs[key];
+
+  await chrome.storage.session.set({ enabledTabs });
 }
 
-chrome.tabs.onUpdated.addListener(async function(tabId, changeInfo, tab) {
-	// Only inject when page has fully loaded
-	if (changeInfo.status !== 'complete') return;
+async function isTabEnabled(tabId) {
+  const enabledTabs = await getEnabledTabs();
+  return !!enabledTabs[String(tabId)];
+}
 
-	// Skip restricted URLs
-	if (isRestrictedUrl(tab.url)) {
-		return;
-	}
+async function getSettings() {
+  return await chrome.storage.local.get({
+    color1: "#0000FF",
+    color2: "#FF0000",
+    color_text: "#000000",
+    gradient_size: 50
+  });
+}
 
-	// Check if domain is blacklisted
-	const domain = getDomainFromUrl(tab.url);
-	if (domain && await isDomainBlacklisted(domain)) {
-		return;
-	}
+// Inject content script into all frames (important for Gmail)
+async function ensureInjectedAllFrames(tabId) {
+  await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    files: ["contentScript.js"]
+  });
+}
 
-	try {
-		const result = await chrome.storage.local.get({
-			color1: "#0000FF",
-			color2: "#FF0000",
-			color_text: "#000000",
-			gradient_size: 50,
-			enabled: false,
-			domainBlacklist: []
-		});
+// Send a message to all frames in the tab (important for Gmail)
+async function sendToAllFrames(tabId, message) {
+  const frames = await chrome.webNavigation.getAllFrames({ tabId });
+  await Promise.all(
+    frames.map(f =>
+      chrome.tabs.sendMessage(tabId, message, { frameId: f.frameId }).catch(() => {})
+    )
+  );
+}
 
-		// If disabled, stop
-		if (!result.enabled) return;
+async function applyToTab(tabId) {
+  const settings = await getSettings();
+  await ensureInjectedAllFrames(tabId);
+  await sendToAllFrames(tabId, {
+    command: "apply_gradient",
+    colors: [settings.color1, settings.color2],
+    color_text: settings.color_text,
+    gradient_size: settings.gradient_size
+  });
+}
 
-		// When the page loads, inject the content script
-		await chrome.scripting.executeScript({
-			target: { tabId: tabId },
-			files: ["/contentScript.js"]
-		});
+async function resetTab(tabId) {
+  await ensureInjectedAllFrames(tabId);
+  await sendToAllFrames(tabId, { command: "reset" });
+}
 
-		// Apply gradient to every new tab if addon is enabled
-		await chrome.tabs.sendMessage(tabId, {
-			command: "apply_gradient",
-			colors: [result.color1, result.color2],
-			color_text: result.color_text,
-			gradient_size: result.gradient_size
-		});
-	} catch (error) {
-		// Silently fail for pages where content scripts cannot be injected
-		// This is expected for restricted pages
-	}
+// ---------- popup messaging ----------
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  (async () => {
+    try {
+      if (msg?.type === "GET_TAB_ENABLED") {
+        sendResponse({ enabled: await isTabEnabled(msg.tabId) });
+        return;
+      }
+
+      if (msg?.type === "SET_TAB_ENABLED") {
+        const tabId = msg.tabId;
+        const desired = !!msg.enabled;
+
+        const tab = await chrome.tabs.get(tabId);
+        if (isRestrictedUrl(tab.url)) {
+          // Can't run here; do not enable
+          await setTabEnabled(tabId, false);
+          sendResponse({ ok: false, reason: "restricted" });
+          return;
+        }
+
+        // Persist per-tab state
+        await setTabEnabled(tabId, desired);
+
+        // Apply/reset immediately
+        try {
+          if (desired) await applyToTab(tabId);
+          else await resetTab(tabId);
+
+          sendResponse({ ok: true });
+        } catch (e) {
+          // If apply fails, revert enabled state
+          if (desired) await setTabEnabled(tabId, false);
+          sendResponse({ ok: false, reason: "inject_failed" });
+        }
+        return;
+      }
+    } catch (e) {
+      sendResponse({ ok: false, reason: "internal_error" });
+    }
+  })();
+
+  return true; // keep port open
+});
+
+// ---------- your preference: turn OFF on refresh/navigation ----------
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (changeInfo.status !== "complete") return;
+  // Any completed navigation/refresh turns it off for that tab
+  await setTabEnabled(tabId, false);
+});
+
+// Cleanup on close
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await setTabEnabled(tabId, false);
 });

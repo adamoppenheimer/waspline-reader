@@ -24,10 +24,12 @@
 		"activeTab",
 		"storage",
 		"scripting",
-		"tabs"
+		"tabs",
+		"webNavigation"
 	],
 	"host_permissions": [
 		"http://*/",
-		"https://*/"
+		"https://*/",
+		"<all_urls>"
 	]
 }
