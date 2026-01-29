@@ -5,7 +5,11 @@ const EXT_DEFAULTS = {
   color1: "#0000FF",
   color2: "#FF0000",
   color_text: "#000000",
-  gradient_size: 50
+  gradient_size: 50,
+
+  // New: percent-based coverage of candidate nodes (0..100)
+  // 0 still means "minimum behavior" (we still enforce at least 400 nodes in content script)
+  node_coverage: 0
 };
 
 // ----- helpers -----
@@ -26,7 +30,7 @@ function isRestrictedUrl(url) {
  * Per-tab state in session storage:
  * tabStates: {
  *   [tabId]: {
- *     enabled: boolean,               // "currently applied to page" state
+ *     enabled: boolean,
  *     settings: { ... },              // selected settings in UI for this tab
  *     appliedSettings: { ... } | null,// settings last applied to the page
  *     settingsIsExplicit: boolean
@@ -88,7 +92,6 @@ async function ensureInjectedAllFrames(tabId) {
 }
 
 async function sendToAllFrames(tabId, message) {
-  // Enumerate frames at send-time so deep frames (e.g., Gmail) are included.
   const frames = await chrome.webNavigation.getAllFrames({ tabId });
   await Promise.all(
     frames.map(f =>
@@ -103,7 +106,8 @@ async function applyToTab(tabId, settings) {
     command: "apply_gradient",
     colors: [settings.color1, settings.color2],
     color_text: settings.color_text,
-    gradient_size: settings.gradient_size
+    gradient_size: settings.gradient_size,
+    node_coverage: settings.node_coverage
   });
 }
 
@@ -112,7 +116,6 @@ async function resetTab(tabId) {
   await sendToAllFrames(tabId, { command: "reset" });
 }
 
-// Effective selected settings for a tab: tab.settings if present, else userDefaults
 async function getSelectedSettingsForTab(tabId) {
   const state = await getTabState(tabId);
   if (state && state.settings) return state.settings;
@@ -133,8 +136,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({
           ok: true,
           enabled: !!state?.enabled,
-          settings: selected,                       // selected in UI for this tab
-          appliedSettings: state?.appliedSettings || null, // last applied to the page
+          settings: selected,
+          appliedSettings: state?.appliedSettings || null,
           userDefaults,
           extDefaults: EXT_DEFAULTS
         });
@@ -153,7 +156,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
 
-        // Ensure tab has selected settings
+        // Ensure selected settings exist
         const current = await getTabState(tabId);
         if (!current?.settings) {
           const userDefaults = await getUserDefaults();
@@ -163,12 +166,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (desired) {
           const settings = await getSelectedSettingsForTab(tabId);
 
-          // Mark enabled before injection; if injection fails we roll back.
           await setTabState(tabId, { enabled: true });
 
           try {
             await applyToTab(tabId, settings);
-            // Only update appliedSettings after a successful apply
             await setTabState(tabId, { appliedSettings: settings });
             sendResponse({ ok: true });
           } catch (_) {
@@ -177,14 +178,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
           return;
         } else {
-          // Restore
           await setTabState(tabId, { enabled: false });
-          try {
-            await resetTab(tabId);
-          } catch (_) {
-            // ignore
-          }
-          // Clear applied settings after restore attempt
+          try { await resetTab(tabId); } catch (_) {}
           await setTabState(tabId, { appliedSettings: null });
           sendResponse({ ok: true });
           return;
@@ -195,6 +190,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg?.type === "SET_TAB_SETTINGS") {
         const tabId = msg.tabId;
         const newSettings = msg.settings;
+
         await setTabState(tabId, { settings: newSettings, settingsIsExplicit: true });
         sendResponse({ ok: true });
         return;
@@ -204,7 +200,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg?.type === "SET_USER_DEFAULTS") {
         const saved = await setUserDefaults(msg.userDefaults);
 
-        // Keep current tab controls aligned if not explicitly customized.
         const tabId = sender?.tab?.id;
         if (typeof tabId === "number") {
           const state = await getTabState(tabId);
@@ -218,7 +213,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
 
-      // Reset selected controls for this tab to defaults (user or extension). Does not auto-apply.
+      // Reset selected controls to defaults; no auto-apply
       if (msg?.type === "RESET_TAB_TO_DEFAULTS") {
         const tabId = msg.tabId;
         const which = msg.which; // "user" | "ext"
@@ -237,10 +232,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true;
 });
 
-// ----- preference: disable on refresh/navigation -----
+// Disable on refresh/navigation
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (changeInfo.status !== "complete") return;
-  // Invalidate "applied" state (page refreshed)
   await setTabState(tabId, { enabled: false, appliedSettings: null });
 });
 

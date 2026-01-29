@@ -40,8 +40,8 @@
       min-width: 0;
     }
 
-    #gradient_size { width: 100%; }
     .row { margin: 10px 0; }
+    #gradient_size, #node_coverage { width: 100%; }
 
     .subtle {
       color: #666;
@@ -51,7 +51,6 @@
 
     .divider { height: 1px; background: #e6e6e6; margin: 10px 0; }
 
-    /* ===== Toast styles ===== */
     .toast {
       position: absolute;
       right: 8px;
@@ -68,17 +67,28 @@
       box-shadow: 0 2px 10px rgba(0,0,0,0.08);
       pointer-events: none;
 
-      /* animation */
       opacity: 0;
       transform: translateY(4px);
-      transition:
-        opacity 180ms ease,
-        transform 180ms ease;
+      transition: opacity 180ms ease, transform 180ms ease;
     }
 
     .toast.visible {
       opacity: 1;
       transform: translateY(0);
+    }
+
+    .slider-label {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 10px;
+    }
+
+    .mono {
+      font-variant-numeric: tabular-nums;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 12px;
+      color: #555;
     }
   </style>
 </head>
@@ -88,42 +98,57 @@
     <h1>WaspLine Reader</h1>
 
     <div class="toolbar">
-      <button id="apply">Apply</button>
-      <button id="restore">Restore</button>
+      <button id="apply" type="button">Apply</button>
+      <button id="restore" type="button">Restore</button>
     </div>
 
     <div class="row">
-      <label>Gradient Size (%)</label>
-      <input type="range" id="gradient_size" min="0" max="100">
+      <div class="slider-label">
+        <label for="node_coverage">Coverage</label>
+        <span id="node_coverage_value" class="mono">0%</span>
+      </div>
+      <input type="range" id="node_coverage" min="0" max="100" value="0">
+      <div class="subtle">Controls how much text is processed around what you’re currently viewing (min 400 items).</div>
     </div>
 
     <div class="row">
-      <input type="color" id="color1"> Color 1
+      <div class="slider-label">
+        <label for="gradient_size">Gradient Size</label>
+        <span id="gradient_size_value" class="mono">50%</span>
+      </div>
+      <input type="range" id="gradient_size" min="0" max="100" value="50">
     </div>
 
     <div class="row">
-      <input type="color" id="color2"> Color 2
+      <input type="color" id="color1" name="color1" value="#0000FF">
+      <label for="color1">Color 1</label>
     </div>
 
     <div class="row">
-      <input type="color" id="color_text"> Text Color
+      <input type="color" id="color2" name="color2" value="#FF0000">
+      <label for="color2">Color 2</label>
+    </div>
+
+    <div class="row">
+      <input type="color" id="color_text" name="color_text" value="#000000">
+      <label for="color_text">Text Color</label>
     </div>
 
     <div class="divider"></div>
 
-    <div style="display:flex;flex-direction:column;gap:8px">
-      <button id="save-my-default">Save current as my default</button>
-      <button id="reset-my-default">Reset controls to my default</button>
-      <button id="reset-ext-default">Reset controls to extension default</button>
+    <div style="display: flex; flex-direction: column; gap: 8px;">
+      <button id="save-my-default" type="button">Save current as my default</button>
+      <button id="reset-my-default" type="button">Reset controls to my default</button>
+      <button id="reset-ext-default" type="button">Reset controls to extension default</button>
+
       <div class="subtle">Tip: Changes only appear after clicking Apply.</div>
     </div>
 
-    <!-- Toast -->
     <div id="toast" class="toast hidden" aria-live="polite">Saved!</div>
   </div>
 
   <div id="error-content" class="hidden">
-    <p>Can't use WaspLine Reader on this page.</p>
+    <p>Can't use WaspLine Reader on this web page.</p>
   </div>
 
   <script src="menu.js"></script>

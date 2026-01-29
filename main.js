@@ -1,16 +1,20 @@
 (function () {
   'use strict';
 
-  // Configuration
-  const MAX_NODES = 400;
-  const BATCH_SIZE = 20;
+  // Minimum number of nodes to process regardless of slider setting
+  const MIN_NODES = 400;
+
+  // When processing more than MIN_NODES, ensure we process at least this fraction of total candidates
+  const MIN_FRACTION_IF_OVER_MIN = 0.95;
+
+  // Batch/gradient settings
+  const BATCH_SIZE = 30;
   const GRADIENT_STEPS = 10;
 
-  // Cache for parsed colors
   const colorCache = new Map();
 
   // SPA support
-  let lastApply = null;      // { colors, colorText, gradientSize }
+  let lastApply = null;      // { colors, colorText, gradientSize, nodeCoverage }
   let observer = null;
   let reapplyTimer = null;
 
@@ -18,7 +22,7 @@
   let isProcessing = false;
   let pendingApply = null;
 
-  // Cancellation token: increment to cancel in-flight work
+  // Cancellation token
   let generation = 0;
 
   // -------------------------
@@ -51,24 +55,146 @@
   }
 
   // -------------------------
-  // DOM targeting
+  // Candidate selection
   // -------------------------
-  function getTargetNodes() {
-    const selector = [
-      'article p', 'main p', '.content p', '.post p', '.article p', 'p',
-      'li', 'blockquote',
+  function isLikelyChatGPT() {
+    const host = location.host || '';
+    return host.includes('chatgpt.com') || host.includes('chat.openai.com');
+  }
 
-      // ChatGPT-ish
-      '.markdown p', '.markdown li', '.markdown blockquote',
-      '.prose p', '.prose li', '.prose blockquote',
-      '[data-message-author-role] p', '[data-message-author-role] li', '[data-message-author-role] blockquote',
+  function dedupePreserveOrder(nodes) {
+    const seen = new Set();
+    const out = [];
+    for (const n of nodes) {
+      if (!n || !n.tagName) continue;
+      if (seen.has(n)) continue;
+      seen.add(n);
+      out.push(n);
+    }
+    return out;
+  }
 
-      // Gmail body
+  function getCandidateNodes() {
+    const genericSelector = [
+      'article p', 'main p', '.content p', '.post p', '.article p',
+      'p', 'li', 'blockquote',
+
+      // Gmail body container
       'div.a3s p', 'div.a3s li', 'div.a3s blockquote'
     ].join(',');
 
-    const all = document.querySelectorAll(selector);
-    return Array.from(all).slice(0, MAX_NODES);
+    const chatSelectorInsideMessages = [
+      '[data-message-author-role] p',
+      '[data-message-author-role] li',
+      '[data-message-author-role] blockquote',
+      '[data-message-author-role] .markdown',
+      '[data-message-author-role] .prose',
+      '[data-message-author-role] [data-message-content]',
+      '[data-message-author-role] div'
+    ].join(',');
+
+    if (isLikelyChatGPT()) {
+      const transcript =
+        document.querySelector('main') ||
+        document.querySelector('[role="main"]') ||
+        document.body;
+
+      let nodes = Array.from(transcript.querySelectorAll(chatSelectorInsideMessages));
+
+      // Filter out obvious huge containers so line detection doesn't go nuclear
+      nodes = nodes.filter(el => {
+        const tag = el.tagName.toLowerCase();
+        if (tag === 'main' || tag === 'body' || tag === 'html') return false;
+        const childBlocks = el.querySelectorAll('p, li, blockquote').length;
+        if (childBlocks >= 3 && (tag === 'div' || tag === 'section')) return false;
+        return true;
+      });
+
+      return dedupePreserveOrder(nodes);
+    }
+
+    return Array.from(document.querySelectorAll(genericSelector));
+  }
+
+  function clampInt(n, min, max) {
+    n = Number(n);
+    if (!Number.isFinite(n)) n = min;
+    n = Math.round(n);
+    return Math.max(min, Math.min(max, n));
+  }
+
+  function computeMaxNodes(totalCandidates, nodeCoveragePercent) {
+    const total = Math.max(0, totalCandidates | 0);
+    const pct = clampInt(nodeCoveragePercent, 0, 100);
+
+    // Base: percent of total, but always at least MIN_NODES
+    let maxNodes = Math.max(MIN_NODES, Math.round(total * (pct / 100)));
+
+    // If user chose enough that we're beyond MIN_NODES, avoid patchiness:
+    // ensure at least 95% coverage, capped to total.
+    if (maxNodes > MIN_NODES) {
+      maxNodes = Math.max(maxNodes, Math.ceil(total * MIN_FRACTION_IF_OVER_MIN));
+    }
+
+    return Math.min(maxNodes, total);
+  }
+
+  function findViewportAnchorIndex(nodes) {
+    // Choose the node whose vertical center is closest to the viewport center.
+    const viewportCenterY = window.innerHeight / 2;
+
+    let bestIdx = 0;
+    let bestDist = Infinity;
+
+    // Prefer nodes near/within viewport first
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      if (!el || !el.getBoundingClientRect) continue;
+
+      const r = el.getBoundingClientRect();
+
+      // Skip totally offscreen far above/below unless we have no better candidates.
+      // We still compute distance so we get something reasonable.
+      const centerY = (r.top + r.bottom) / 2;
+      const dist = Math.abs(centerY - viewportCenterY);
+
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIdx = i;
+      }
+    }
+
+    return bestIdx;
+  }
+
+  function getTargetNodes(nodeCoveragePercent) {
+    const candidates = getCandidateNodes();
+    const total = candidates.length;
+    if (total === 0) return [];
+
+    const maxNodes = computeMaxNodes(total, nodeCoveragePercent);
+    if (maxNodes >= total) return candidates;
+
+    const anchor = findViewportAnchorIndex(candidates);
+
+    const halfBefore = Math.floor(maxNodes / 2);
+    const halfAfter = maxNodes - halfBefore;
+
+    let start = anchor - halfBefore;
+    let end = anchor + halfAfter;
+
+    // Clamp window into bounds, preserving size
+    if (start < 0) {
+      end += -start;
+      start = 0;
+    }
+    if (end > total) {
+      const over = end - total;
+      start = Math.max(0, start - over);
+      end = total;
+    }
+
+    return candidates.slice(start, end);
   }
 
   // -------------------------
@@ -133,7 +259,6 @@
   }
 
   function processBatch(nodes, startIdx, colors, baseColor, gradientSize, lineno, resolve, myGen) {
-    // Cancel if generation changed
     if (myGen !== generation) {
       resolve();
       return;
@@ -163,7 +288,6 @@
             resolve();
             return;
           }
-
           if (!line || line.length === 0) continue;
 
           const colorIdx = Math.floor(lineno / 2) % activeColors.length;
@@ -179,7 +303,9 @@
           colorLine(line, gradientColors, isLeft);
           lineno++;
         }
-      } catch (_) { /* ignore */ }
+      } catch (_) {
+        // ignore
+      }
     }
 
     if (endIdx < nodes.length) {
@@ -191,14 +317,14 @@
     }
   }
 
-  function applyGradient(colors, colorText, gradientSize, myGen) {
+  function applyGradient(colors, colorText, gradientSize, nodeCoverage, myGen) {
     return new Promise((resolve) => {
       if (myGen !== generation) {
         resolve();
         return;
       }
 
-      const nodes = getTargetNodes();
+      const nodes = getTargetNodes(nodeCoverage);
       if (nodes.length === 0) {
         resolve();
         return;
@@ -223,7 +349,6 @@
 
       clearTimeout(reapplyTimer);
       reapplyTimer = setTimeout(() => {
-        // Top-up only; do not reset
         const nodes = document.querySelectorAll('[data-waspline-processed="1"]');
         for (const n of nodes) delete n.dataset.wasplineProcessed;
 
@@ -231,6 +356,7 @@
           colors: lastApply.colors,
           color_text: lastApply.colorText,
           gradient_size: lastApply.gradientSize,
+          node_coverage: lastApply.nodeCoverage,
           mode: 'spa_topup'
         });
       }, 250);
@@ -256,7 +382,8 @@
     const mc = Array.isArray(msg.colors) ? msg.colors.join(',') : '';
     return lc === mc &&
       String(last.colorText) === String(msg.color_text) &&
-      Number(last.gradientSize) === Number(msg.gradient_size);
+      Number(last.gradientSize) === Number(msg.gradient_size) &&
+      Number(last.nodeCoverage) === Number(msg.node_coverage);
   }
 
   function enqueueApply(msg) {
@@ -273,24 +400,22 @@
     pendingApply = null;
 
     isProcessing = true;
-
-    // Snapshot generation for this run
     const myGen = generation;
 
     try {
       const colors = Array.isArray(msg.colors) ? msg.colors : [];
       const colorText = String(msg.color_text || '#000000');
       const gradientSize = Number(msg.gradient_size);
+      const nodeCoverage = Number(msg.node_coverage ?? 0);
 
-      lastApply = { colors, colorText, gradientSize };
+      lastApply = { colors, colorText, gradientSize, nodeCoverage };
       startObserver();
 
       if (msg.mode !== 'spa_topup') {
-        // Clean recolor for explicit Apply
         resetColors();
       }
 
-      await applyGradient(colors, colorText, gradientSize, myGen);
+      await applyGradient(colors, colorText, gradientSize, nodeCoverage, myGen);
     } finally {
       isProcessing = false;
       if (pendingApply) void drainQueue();
@@ -307,7 +432,6 @@
     }
 
     if (message.command === "reset") {
-      // Cancel any in-flight apply immediately
       generation++;
       pendingApply = null;
       lastApply = null;
@@ -322,6 +446,7 @@
         colors: message.colors,
         color_text: message.color_text,
         gradient_size: message.gradient_size,
+        node_coverage: message.node_coverage,
         mode: 'apply'
       };
 
@@ -330,7 +455,6 @@
         return true;
       }
 
-      // New apply supersedes old: cancel in-flight work then queue
       generation++;
       enqueueApply(msg);
       sendResponse({ status: "queued" });

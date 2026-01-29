@@ -6,6 +6,10 @@ const color2 = document.getElementById('color2');
 const color_text = document.getElementById('color_text');
 const gradient_size = document.getElementById('gradient_size');
 
+const node_coverage = document.getElementById('node_coverage');
+const node_coverage_value = document.getElementById('node_coverage_value');
+const gradient_size_value = document.getElementById('gradient_size_value');
+
 const btnApply = document.getElementById('apply');
 const btnRestore = document.getElementById('restore');
 
@@ -71,21 +75,42 @@ async function getActiveTab() {
   return tabs?.[0] || null;
 }
 
+function clampInt(n, min, max) {
+  n = Number(n);
+  if (!Number.isFinite(n)) n = min;
+  return Math.max(min, Math.min(max, Math.round(n)));
+}
+
 function readSettingsFromUI() {
   return {
     color1: color1?.value ?? "#0000FF",
     color2: color2?.value ?? "#FF0000",
     color_text: color_text?.value ?? "#000000",
-    gradient_size: Number(gradient_size?.value ?? 50)
+    gradient_size: clampInt(gradient_size?.value ?? 50, 0, 100),
+    node_coverage: clampInt(node_coverage?.value ?? 0, 0, 100)
   };
 }
 
 function writeSettingsToUI(settings) {
   if (!settings) return;
+
   if (color1) color1.value = settings.color1 ?? "#0000FF";
   if (color2) color2.value = settings.color2 ?? "#FF0000";
   if (color_text) color_text.value = settings.color_text ?? "#000000";
+
   if (gradient_size) gradient_size.value = String(settings.gradient_size ?? 50);
+  if (node_coverage) node_coverage.value = String(settings.node_coverage ?? 0);
+
+  refreshSliderLabels();
+}
+
+function refreshSliderLabels() {
+  if (node_coverage && node_coverage_value) {
+    node_coverage_value.textContent = `${clampInt(node_coverage.value, 0, 100)}%`;
+  }
+  if (gradient_size && gradient_size_value) {
+    gradient_size_value.textContent = `${clampInt(gradient_size.value, 0, 100)}%`;
+  }
 }
 
 function settingsEqual(a, b) {
@@ -93,41 +118,36 @@ function settingsEqual(a, b) {
   return String(a.color1) === String(b.color1) &&
     String(a.color2) === String(b.color2) &&
     String(a.color_text) === String(b.color_text) &&
-    Number(a.gradient_size) === Number(b.gradient_size);
+    Number(a.gradient_size) === Number(b.gradient_size) &&
+    Number(a.node_coverage) === Number(b.node_coverage);
 }
 
 async function getTabInfo(tabId) {
   return await chrome.runtime.sendMessage({ type: "GET_TAB_INFO", tabId });
 }
 
-// Toast UI
+// Toast (fade out)
 function hideToast() {
   if (!toast) return;
+  toast.classList.remove('visible');
   toast.classList.add('hidden');
 }
-
 function showToast(message, duration = 1500) {
   if (!toast) return;
 
   toast.textContent = message;
 
-  // Ensure clean state
   toast.classList.remove('hidden');
   toast.classList.remove('visible');
 
-  // Allow DOM to apply initial styles
-  requestAnimationFrame(() => {
-    toast.classList.add('visible');
-  });
+  requestAnimationFrame(() => toast.classList.add('visible'));
 
   if (toastTimer) clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
     toast.classList.remove('visible');
-
-    // Wait for fade-out to finish before hiding completely
     setTimeout(() => {
       toast.classList.add('hidden');
-    }, 200); // must match CSS transition duration
+    }, 200);
   }, duration);
 }
 
@@ -157,6 +177,7 @@ function refreshButtons() {
 // ----- init / sync -----
 async function syncUIToCurrentTab() {
   hideToast();
+  refreshSliderLabels();
 
   const tab = await getActiveTab();
   if (!tab) {
@@ -192,8 +213,10 @@ async function syncUIToCurrentTab() {
   refreshButtons();
 }
 
-// ----- settings changes: store selected settings only -----
+// Store selected settings only (does NOT auto-apply)
 async function onSettingsChanged() {
+  refreshSliderLabels();
+
   if (!lastAllowed || typeof lastTabId !== "number") {
     refreshButtons();
     return;
@@ -326,17 +349,16 @@ async function onResetExtDefault() {
   await syncUIToCurrentTab();
 })();
 
-// Controls changes do not auto-apply
+// Listeners
+bind(node_coverage, "input", onSettingsChanged);
 bind(gradient_size, "input", onSettingsChanged);
 bind(color1, "input", onSettingsChanged);
 bind(color2, "input", onSettingsChanged);
 bind(color_text, "input", onSettingsChanged);
 
-// Apply / Restore
 bind(btnApply, "click", onApply);
 bind(btnRestore, "click", onRestore);
 
-// Defaults
 bind(btnSaveMyDefault, "click", onSaveMyDefault);
 bind(btnResetMyDefault, "click", onResetMyDefault);
 bind(btnResetExtDefault, "click", onResetExtDefault);
