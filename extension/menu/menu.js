@@ -1,6 +1,5 @@
 'use strict';
 
-// ----- DOM refs -----
 const color1 = document.getElementById('color1');
 const color2 = document.getElementById('color2');
 const color_text = document.getElementById('color_text');
@@ -23,13 +22,19 @@ const errorContent = document.getElementById('error-content');
 const toast = document.getElementById('toast');
 let toastTimer = null;
 
-// Defensive binder
+// Mode UI
+const site_mode = document.getElementById('site_mode');
+const site_host = document.getElementById('site_host');
+
+// NEW safe speed UI
+const safe_cycle_lines = document.getElementById('safe_cycle_lines');
+const safe_cycle_lines_value = document.getElementById('safe_cycle_lines_value');
+
 function bind(el, eventName, handler) {
   if (!el) return;
   el.addEventListener(eventName, handler);
 }
 
-// ----- helpers -----
 function isRestrictedUrl(url) {
   if (!url) return true;
   return url.startsWith('chrome://') ||
@@ -60,7 +65,6 @@ function showPopup(ok) {
   }
 }
 
-// MV3 injection check on active tab
 function canInjectIntoTab(tabId) {
   return new Promise((resolve) => {
     chrome.scripting.executeScript(
@@ -81,13 +85,28 @@ function clampInt(n, min, max) {
   return Math.max(min, Math.min(max, Math.round(n)));
 }
 
+function refreshSliderLabels() {
+  if (node_coverage && node_coverage_value) {
+    node_coverage_value.textContent = `${clampInt(node_coverage.value, 0, 100)}%`;
+  }
+  if (gradient_size && gradient_size_value) {
+    gradient_size_value.textContent = `${clampInt(gradient_size.value, 0, 100)}%`;
+  }
+  if (safe_cycle_lines && safe_cycle_lines_value) {
+    safe_cycle_lines_value.textContent = `${clampInt(safe_cycle_lines.value, 2, 30)}`;
+  }
+}
+
 function readSettingsFromUI() {
   return {
     color1: color1?.value ?? "#0000FF",
     color2: color2?.value ?? "#FF0000",
     color_text: color_text?.value ?? "#000000",
     gradient_size: clampInt(gradient_size?.value ?? 50, 0, 100),
-    node_coverage: clampInt(node_coverage?.value ?? 0, 0, 100)
+    node_coverage: clampInt(node_coverage?.value ?? 0, 0, 100),
+
+    // NEW
+    safe_cycle_lines: clampInt(safe_cycle_lines?.value ?? 6, 2, 30)
   };
 }
 
@@ -101,16 +120,9 @@ function writeSettingsToUI(settings) {
   if (gradient_size) gradient_size.value = String(settings.gradient_size ?? 50);
   if (node_coverage) node_coverage.value = String(settings.node_coverage ?? 0);
 
-  refreshSliderLabels();
-}
+  if (safe_cycle_lines) safe_cycle_lines.value = String(settings.safe_cycle_lines ?? 6);
 
-function refreshSliderLabels() {
-  if (node_coverage && node_coverage_value) {
-    node_coverage_value.textContent = `${clampInt(node_coverage.value, 0, 100)}%`;
-  }
-  if (gradient_size && gradient_size_value) {
-    gradient_size_value.textContent = `${clampInt(gradient_size.value, 0, 100)}%`;
-  }
+  refreshSliderLabels();
 }
 
 function settingsEqual(a, b) {
@@ -119,14 +131,21 @@ function settingsEqual(a, b) {
     String(a.color2) === String(b.color2) &&
     String(a.color_text) === String(b.color_text) &&
     Number(a.gradient_size) === Number(b.gradient_size) &&
-    Number(a.node_coverage) === Number(b.node_coverage);
+    Number(a.node_coverage) === Number(b.node_coverage) &&
+    Number(a.safe_cycle_lines) === Number(b.safe_cycle_lines);
 }
 
 async function getTabInfo(tabId) {
   return await chrome.runtime.sendMessage({ type: "GET_TAB_INFO", tabId });
 }
 
-// Toast (fade out)
+async function getSiteMode(tabId) {
+  return await chrome.runtime.sendMessage({ type: "GET_SITE_MODE", tabId });
+}
+async function setSiteMode(tabId, siteMode) {
+  return await chrome.runtime.sendMessage({ type: "SET_SITE_MODE", tabId, siteMode });
+}
+
 function hideToast() {
   if (!toast) return;
   toast.classList.remove('visible');
@@ -136,27 +155,26 @@ function showToast(message, duration = 1500) {
   if (!toast) return;
 
   toast.textContent = message;
-
   toast.classList.remove('hidden');
   toast.classList.remove('visible');
-
   requestAnimationFrame(() => toast.classList.add('visible'));
 
   if (toastTimer) clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
     toast.classList.remove('visible');
-    setTimeout(() => {
-      toast.classList.add('hidden');
-    }, 200);
+    setTimeout(() => toast.classList.add('hidden'), 200);
   }, duration);
 }
 
 // ----- state -----
-let lastInfo = null;   // { enabled, settings, appliedSettings, ... }
+let lastInfo = null;
 let lastTabId = null;
 let lastAllowed = false;
 
-// ----- UI state -----
+function getUiMode() {
+  return (site_mode?.value === "full") ? "full" : "safe";
+}
+
 function refreshButtons() {
   const notAllowedReason = "Chrome blocked script injection on this site.";
   setButtonAllowed(btnApply, lastAllowed, notAllowedReason);
@@ -168,13 +186,29 @@ function refreshButtons() {
   const applied = !!lastInfo?.enabled;
   const appliedSettings = lastInfo?.appliedSettings;
 
+  const appliedMode = (lastInfo?.appliedMode === "full") ? "full" : "safe";
+  const uiMode = getUiMode();
+
   setButtonAllowed(btnRestore, applied, applied ? "" : "Nothing to restore.");
 
-  const canApply = !applied || !settingsEqual(ui, appliedSettings);
-  setButtonAllowed(btnApply, canApply, canApply ? "" : "These settings are already applied.");
+  const canApply = !applied ||
+    !settingsEqual(ui, appliedSettings) ||
+    (uiMode !== appliedMode);
+
+  setButtonAllowed(btnApply, canApply, canApply ? "" : "These settings + mode are already applied.");
 }
 
-// ----- init / sync -----
+async function syncModeUI(tabId) {
+  if (!site_mode) return;
+
+  const res = await getSiteMode(tabId);
+  if (!res?.ok) return;
+
+  if (site_host) site_host.textContent = res.host || "";
+  site_mode.value = res.mode === "full" ? "full" : "safe";
+  refreshButtons();
+}
+
 async function syncUIToCurrentTab() {
   hideToast();
   refreshSliderLabels();
@@ -210,10 +244,10 @@ async function syncUIToCurrentTab() {
   lastInfo = await getTabInfo(tab.id);
   if (lastInfo?.ok) writeSettingsToUI(lastInfo.settings);
 
+  await syncModeUI(tab.id);
   refreshButtons();
 }
 
-// Store selected settings only (does NOT auto-apply)
 async function onSettingsChanged() {
   refreshSliderLabels();
 
@@ -235,7 +269,16 @@ async function onSettingsChanged() {
   refreshButtons();
 }
 
-// ----- Apply / Restore -----
+async function onModeChanged() {
+  if (!lastAllowed || typeof lastTabId !== "number") return;
+
+  const v = getUiMode();
+  const res = await setSiteMode(lastTabId, v);
+  if (res?.ok) showToast(v === "full" ? "Full mode enabled" : "Safe mode enabled", 1300);
+
+  refreshButtons();
+}
+
 async function onApply() {
   const tab = await getActiveTab();
   if (!tab) return;
@@ -271,6 +314,7 @@ async function onApply() {
     if (lastInfo?.ok) {
       lastInfo.enabled = false;
       lastInfo.appliedSettings = null;
+      lastInfo.appliedMode = null;
     }
     refreshButtons();
   }
@@ -300,7 +344,6 @@ async function onRestore() {
   refreshButtons();
 }
 
-// ----- defaults buttons -----
 async function onSaveMyDefault() {
   const settings = readSettingsFromUI();
   const res = await chrome.runtime.sendMessage({
@@ -344,17 +387,18 @@ async function onResetExtDefault() {
   }
 }
 
-// ----- init -----
 (async function init() {
   await syncUIToCurrentTab();
 })();
 
-// Listeners
 bind(node_coverage, "input", onSettingsChanged);
 bind(gradient_size, "input", onSettingsChanged);
 bind(color1, "input", onSettingsChanged);
 bind(color2, "input", onSettingsChanged);
 bind(color_text, "input", onSettingsChanged);
+bind(safe_cycle_lines, "input", onSettingsChanged);
+
+bind(site_mode, "change", onModeChanged);
 
 bind(btnApply, "click", onApply);
 bind(btnRestore, "click", onRestore);
