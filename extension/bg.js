@@ -1,24 +1,20 @@
 // bg.js (MV3 service worker)
 
-// ----- extension defaults -----
 const EXT_DEFAULTS = {
   color1: "#0000FF",
   color2: "#FF0000",
   color_text: "#000000",
   gradient_size: 50,
   node_coverage: 0,
-
-  // NEW: Safe mode control — how many "lines" per color sweep (smaller = faster change)
   safe_cycle_lines: 6
 };
 
-// Mode prefs (stored separately from userDefaults to avoid breaking your existing defaults UX)
+// CHANGED: Full is the global default now
 const MODE_DEFAULTS = {
-  defaultMode: "safe", // safe-by-default everywhere
-  siteModes: {}        // { "host": "full" } overrides only
+  defaultMode: "full",
+  siteModes: {} // { "host": "safe" | "full" } -- we'll store only overrides
 };
 
-// ----- helpers -----
 function isRestrictedUrl(url) {
   if (!url) return true;
   return url.startsWith('chrome://') ||
@@ -33,25 +29,9 @@ function isRestrictedUrl(url) {
 }
 
 function getHostFromUrl(url) {
-  try {
-    return new URL(url).host || "";
-  } catch (_) {
-    return "";
-  }
+  try { return new URL(url).host || ""; } catch (_) { return ""; }
 }
 
-/**
- * Per-tab state in session storage:
- * tabStates: {
- *   [tabId]: {
- *     enabled: boolean,
- *     settings: { ... },
- *     appliedSettings: { ... } | null,
- *     appliedMode: "safe" | "full" | null,
- *     settingsIsExplicit: boolean
- *   }
- * }
- */
 async function getTabStates() {
   const result = await chrome.storage.session.get({ tabStates: {} });
   return result.tabStates || {};
@@ -66,6 +46,7 @@ async function getTabState(tabId) {
 async function setTabState(tabId, patch) {
   const tabStates = await getTabStates();
   const key = String(tabId);
+
   const prev = tabStates[key] || {
     enabled: false,
     settings: null,
@@ -90,10 +71,8 @@ async function clearTabState(tabId) {
   await setTabStates(tabStates);
 }
 
-// User defaults in local storage
 async function getUserDefaults() {
   const result = await chrome.storage.local.get({ userDefaults: EXT_DEFAULTS });
-  // Ensure new key exists even for old installs
   const u = result.userDefaults || EXT_DEFAULTS;
   if (u.safe_cycle_lines === undefined) u.safe_cycle_lines = EXT_DEFAULTS.safe_cycle_lines;
   return u;
@@ -103,27 +82,29 @@ async function setUserDefaults(newDefaults) {
   return newDefaults;
 }
 
-// Mode prefs in local storage
 async function getModePrefs() {
   const result = await chrome.storage.local.get({ modePrefs: MODE_DEFAULTS });
   const prefs = result.modePrefs || MODE_DEFAULTS;
-  const defaultMode = prefs.defaultMode === "full" ? "full" : "safe";
+
+  // Normalize
+  const defaultMode = prefs.defaultMode === "safe" ? "safe" : "full";
   const siteModes = (prefs.siteModes && typeof prefs.siteModes === "object") ? prefs.siteModes : {};
   return { defaultMode, siteModes };
 }
+
 async function setModePrefs(prefs) {
   await chrome.storage.local.set({ modePrefs: prefs });
   return prefs;
 }
+
 async function resolveModeForTabUrl(url) {
   const host = getHostFromUrl(url);
   const prefs = await getModePrefs();
   const override = prefs.siteModes?.[host];
-  const mode = (override === "full") ? "full" : prefs.defaultMode; // safe default
+  const mode = (override === "safe" || override === "full") ? override : prefs.defaultMode;
   return { host, mode, prefs };
 }
 
-// Injection helpers
 async function ensureInjectedAllFrames(tabId) {
   await chrome.scripting.executeScript({
     target: { tabId, allFrames: true },
@@ -151,10 +132,7 @@ async function applyToTab(tabId, tabUrl, settings) {
     color_text: settings.color_text,
     gradient_size: settings.gradient_size,
     node_coverage: settings.node_coverage,
-
-    // NEW: safe mode line-cycle control
     safe_cycle_lines: settings.safe_cycle_lines,
-
     mode
   });
 
@@ -172,7 +150,6 @@ async function getSelectedSettingsForTab(tabId) {
   return await getUserDefaults();
 }
 
-// ----- messaging API for popup -----
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
@@ -180,7 +157,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const tabId = msg.tabId;
         const state = await getTabState(tabId);
         const userDefaults = await getUserDefaults();
-
         const selected = state?.settings || userDefaults;
 
         sendResponse({
@@ -200,12 +176,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const tab = await chrome.tabs.get(tabId);
         const { host, mode, prefs } = await resolveModeForTabUrl(tab.url);
 
-        sendResponse({
-          ok: true,
-          host,
-          mode,
-          isOverridden: prefs.siteModes?.[host] === "full"
-        });
+        const isOverridden = prefs.siteModes?.[host] === "safe" || prefs.siteModes?.[host] === "full";
+        sendResponse({ ok: true, host, mode, isOverridden });
         return;
       }
 
@@ -215,13 +187,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const host = getHostFromUrl(tab.url);
 
         const prefs = await getModePrefs();
-        const next = (msg.siteMode === "full") ? "full" : "safe";
+
+        // CHANGED: preserve the existing global defaultMode
+        const next = (msg.siteMode === "safe") ? "safe" : "full";
 
         const siteModes = { ...(prefs.siteModes || {}) };
-        if (next === "full") siteModes[host] = "full";
-        else delete siteModes[host];
 
-        await setModePrefs({ defaultMode: "safe", siteModes });
+        // Store only if it's an override; if it matches default, remove override
+        if (next === prefs.defaultMode) {
+          delete siteModes[host];
+        } else {
+          siteModes[host] = next;
+        }
+
+        await setModePrefs({ defaultMode: prefs.defaultMode, siteModes });
+
         sendResponse({ ok: true, host, siteMode: next });
         return;
       }
